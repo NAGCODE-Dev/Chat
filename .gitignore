@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.venv/
+backend/.venv/
+agent/.venv/
+
+# Dados locais e segredos
+*.db
+*.db-wal
+*.db-shm
+.env
+journal.jsonl*
+
+# Flutter / Dart
+app_flutter/.dart_tool/
+app_flutter/build/
+app_flutter/.flutter-plugins-dependencies
+app_flutter/linux/flutter/ephemeral/
+app_flutter/android/.gradle/
+app_flutter/android/local.properties
+
+# Editores e sistema
+.idea/
+.vscode/
+*.swp
+.DS_Store

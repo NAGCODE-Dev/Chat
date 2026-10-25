@@ -1,0 +1,372 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#101311">
+  <meta name="description" content="Controle pessoal de dinheiro, investimentos e patrimônio.">
+
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icon.svg">
+  <link rel="stylesheet" href="style.css">
+
+  <title>Meu Dinheiro</title>
+</head>
+
+<body>
+<main>
+
+  <header class="top">
+    <div>
+      <h1>Meu Dinheiro</h1>
+      <p class="sub">Meu dinheiro, Meu futuro.</p>
+    </div>
+
+    <button id="clearData" class="secondary" title="Apagar todos os dados">
+      ↺
+    </button>
+  </header>
+
+  <!-- RESUMO -->
+  <section class="hero card">
+    <div class="small">Patrimônio investido</div>
+    <div id="patrimonio" class="value">R$ 0,00</div>
+
+    <div class="hero-info">
+      <span>
+        Investido: <strong id="totalInvestido">R$ 0,00</strong>
+      </span>
+
+      <span>
+        Rendimento: <strong id="totalRendimento">R$ 0,00</strong>
+      </span>
+    </div>
+
+    <div class="progress">
+      <i id="goalBar"></i>
+    </div>
+
+    <div class="small goal-text">
+      Meta de aportes: R$ 7.500
+    </div>
+  </section>
+
+  <!-- ENTRADAS E SAÍDAS -->
+  <section class="grid">
+    <div class="card">
+      <div class="small">Entradas</div>
+      <div id="entradas" class="value">R$ 0,00</div>
+    </div>
+
+    <div class="card">
+      <div class="small">Saídas</div>
+      <div id="saidas" class="value">R$ 0,00</div>
+    </div>
+  </section>
+
+  <!-- RENDA -->
+  <section class="card">
+    <h2>Minha renda</h2>
+
+    <p class="small">
+      Informe quanto você espera receber neste mês.
+      A divisão será recalculada automaticamente.
+    </p>
+
+    <div class="two">
+      <div>
+        <label for="monthlyIncome">Renda mensal</label>
+        <input
+          id="monthlyIncome"
+          type="number"
+          min="0"
+          step="0.01"
+          placeholder="Ex.: 900"
+        >
+      </div>
+
+      <div>
+        <label for="monthReference">Mês</label>
+        <input
+          id="monthReference"
+          type="month"
+        >
+      </div>
+    </div>
+  </section>
+
+  <!-- DIVISÃO -->
+  <section class="card">
+    <div class="section-heading">
+      <div>
+        <h2>Divisão da renda</h2>
+        <p class="small">Você define as porcentagens.</p>
+      </div>
+
+      <strong id="percentageTotal">100%</strong>
+    </div>
+
+    <div class="budget-list">
+
+      <div class="budget-row">
+        <div>
+          <strong>Necessidades</strong>
+          <span>Contas e gastos fixos</span>
+        </div>
+
+        <div class="budget-controls">
+          <input class="budget-percent" data-category="necessidades" type="number" min="0" max="100" step="1">
+          <strong id="budgetNecessidades">R$ 0,00</strong>
+        </div>
+      </div>
+
+      <div class="budget-row">
+        <div>
+          <strong>Comida + roupas</strong>
+          <span>Gastos pessoais</span>
+        </div>
+
+        <div class="budget-controls">
+          <input class="budget-percent" data-category="comida" type="number" min="0" max="100" step="1">
+          <strong id="budgetComida">R$ 0,00</strong>
+        </div>
+      </div>
+
+      <div class="budget-row">
+        <div>
+          <strong>Patrimônio</strong>
+          <span>Investimentos</span>
+        </div>
+
+        <div class="budget-controls">
+          <input class="budget-percent" data-category="patrimonio" type="number" min="0" max="100" step="1">
+          <strong id="budgetPatrimonio">R$ 0,00</strong>
+        </div>
+      </div>
+
+      <div class="budget-row">
+        <div>
+          <strong>Objetivos</strong>
+          <span>Viagens, compras e metas</span>
+        </div>
+
+        <div class="budget-controls">
+          <input class="budget-percent" data-category="objetivos" type="number" min="0" max="100" step="1">
+          <strong id="budgetObjetivos">R$ 0,00</strong>
+        </div>
+      </div>
+
+      <div class="budget-row">
+        <div>
+          <strong>Lazer / livre</strong>
+          <span>Dinheiro sem destino específico</span>
+        </div>
+
+        <div class="budget-controls">
+          <input class="budget-percent" data-category="lazer" type="number" min="0" max="100" step="1">
+          <strong id="budgetLazer">R$ 0,00</strong>
+        </div>
+      </div>
+
+    </div>
+
+    <div id="percentageWarning" class="warning hidden">
+      As porcentagens precisam totalizar 100%.
+    </div>
+  </section>
+
+  <!-- CDI -->
+  <section class="card">
+    <h2>Referência do CDI</h2>
+
+    <p class="small">
+      Use a taxa anual do CDI para estimar o rendimento dos investimentos
+      que acompanham o CDI.
+    </p>
+
+    <div class="two">
+      <div>
+        <label for="cdiRate">CDI anual (%)</label>
+        <input
+          id="cdiRate"
+          type="number"
+          min="0"
+          step="0.01"
+          placeholder="Ex.: 14,90"
+        >
+      </div>
+
+      <div class="rate-preview">
+        <span>CDI mensal estimado</span>
+        <strong id="monthlyCdi">0,00%</strong>
+      </div>
+    </div>
+  </section>
+
+  <!-- INVESTIMENTOS -->
+  <section class="card">
+    <div class="section-heading">
+      <div>
+        <h2>Investimentos</h2>
+        <p class="small">Veja quanto cada investimento pode render.</p>
+      </div>
+    </div>
+
+    <div id="investmentList" class="investment-list">
+      <div class="empty">
+        Nenhum investimento cadastrado.
+      </div>
+    </div>
+
+    <hr>
+
+    <h3>Novo investimento</h3>
+
+    <form id="investmentForm">
+
+      <input
+        id="investmentName"
+        type="text"
+        placeholder="Nome (ex.: CDB Inter)"
+        required
+      >
+
+      <div class="two">
+        <div>
+          <label for="investmentAmount">Valor investido</label>
+          <input
+            id="investmentAmount"
+            type="number"
+            min="0"
+            step="0.01"
+            placeholder="R$"
+            required
+          >
+        </div>
+
+        <div>
+          <label for="investmentType">Tipo de rendimento</label>
+          <select id="investmentType">
+            <option value="monthly">Taxa mensal</option>
+            <option value="cdi">% do CDI</option>
+          </select>
+        </div>
+      </div>
+
+      <div id="monthlyRateField">
+        <label for="investmentRate">Taxa mensal (%)</label>
+        <input
+          id="investmentRate"
+          type="number"
+          min="0"
+          step="0.01"
+          placeholder="Ex.: 0,80"
+        >
+      </div>
+
+      <div id="cdiPercentField" class="hidden">
+        <label for="investmentCdiPercent">% do CDI</label>
+        <input
+          id="investmentCdiPercent"
+          type="number"
+          min="0"
+          step="1"
+          placeholder="Ex.: 100"
+        >
+      </div>
+
+      <button type="submit">
+        Adicionar investimento
+      </button>
+    </form>
+  </section>
+
+  <!-- LANÇAMENTOS -->
+  <section class="card">
+    <h2>Adicionar lançamento</h2>
+
+    <form id="transactionForm">
+
+      <div class="two">
+        <select id="transactionType">
+          <option value="entrada">Entrada</option>
+          <option value="saida">Saída</option>
+          <option value="investimento">Investimento</option>
+        </select>
+
+        <input
+          id="transactionValue"
+          type="number"
+          min="0"
+          step="0.01"
+          placeholder="Valor (R$)"
+          required
+        >
+      </div>
+
+      <div class="two">
+        <select id="transactionCategory">
+          <option>Salário</option>
+          <option>Freela</option>
+          <option>Investimento</option>
+          <option>Necessidades</option>
+          <option>Comida</option>
+          <option>Roupas</option>
+          <option>Objetivos</option>
+          <option>Lazer</option>
+          <option>Outros</option>
+        </select>
+
+        <input
+          id="transactionDate"
+          type="date"
+          required
+        >
+      </div>
+
+      <input
+        id="transactionNote"
+        placeholder="Descrição (opcional)"
+      >
+
+      <button type="submit">
+        Adicionar lançamento
+      </button>
+    </form>
+  </section>
+
+  <!-- HISTÓRICO -->
+  <section class="card">
+    <h2>Histórico</h2>
+
+    <div id="transactionList" class="empty">
+      Nenhum lançamento ainda.
+    </div>
+  </section>
+
+</main>
+
+<div id="authGate" class="auth-gate hidden">
+  <div class="card auth-card">
+    <h2>Conectar ao Chat</h2>
+    <p class="small">
+      Cole o token do app Chat para acessar seus lançamentos. Ele fica salvo
+      apenas neste aparelho.
+    </p>
+    <form id="authForm">
+      <input
+        id="authToken"
+        type="password"
+        placeholder="Token do Chat"
+        autocomplete="off"
+        required
+      >
+      <button type="submit">Entrar</button>
+    </form>
+    <p id="authError" class="small auth-error hidden"></p>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
