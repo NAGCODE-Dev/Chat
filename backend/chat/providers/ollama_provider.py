@@ -28,6 +28,8 @@ log = get_logger("chat.providers.ollama")
 
 def _to_ollama_message(m: Message) -> dict[str, Any]:
     result: dict[str, Any] = {"role": m.role, "content": m.content}
+    if m.images:
+        result["images"] = list(m.images)
     if m.tool_calls:
         result["tool_calls"] = [
             {"function": {"name": tc.name, "arguments": tc.arguments}}
@@ -41,7 +43,7 @@ def _to_ollama_message(m: Message) -> dict[str, Any]:
 class OllamaProvider(ModelProvider):
     """Implementação concreta para Ollama."""
 
-    def __init__(self, base_url: str = "http://127.0.0.1:11434", timeout: float = 120.0) -> None:
+    def __init__(self, base_url: str = "http://127.0.0.1:11434", timeout: float = 600.0) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
 
@@ -114,10 +116,13 @@ class OllamaProvider(ModelProvider):
             )
             for i, tc in enumerate(msg.get("tool_calls", []))
         ]
+        finish_reason = data.get("done_reason")
+        if not finish_reason:
+            finish_reason = "tool_calls" if tool_calls else "stop"
         return ModelResponse(
             content=msg.get("content", ""),
             tool_calls=tool_calls,
-            finish_reason="tool_calls" if tool_calls else "stop",
+            finish_reason=finish_reason,
             raw={"model": data.get("model"), "eval_count": data.get("eval_count")},
         )
 
@@ -182,6 +187,11 @@ class OllamaProvider(ModelProvider):
                     if calls:
                         yield {"tool_calls": calls}
                     if chunk.get("done"):
+                        # "length" indica que o modelo parou no limite de
+                        # tokens; o serviço usa isso para continuar o texto.
+                        yield {
+                            "done_reason": chunk.get("done_reason") or "stop",
+                        }
                         break
         except (httpx.HTTPError, json.JSONDecodeError) as e:
             raise ProviderError(f"Erro de streaming no Ollama: {e}") from e

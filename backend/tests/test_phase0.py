@@ -117,13 +117,15 @@ async def test_migrations_and_tables(tmp_path: Path):
             "memory_embeddings",
             "finance_transactions",
             "finance_state",
+            "attachments",
+            "ubuntu_tasks",
         ):
             assert expected in tables, f"falta tabela/trigger {expected}"
 
         # migração idempotente
         await db.migrate()
         row = await db.fetch_one("SELECT MAX(version) v FROM schema_version")
-        assert row["v"] == 5
+        assert row["v"] == 7
 
         # FTS indexa inserções
         await db.execute(

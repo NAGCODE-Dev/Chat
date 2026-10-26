@@ -29,11 +29,16 @@ async def get_settings() -> dict:
         "model_large": state.settings.model_large,
         "model_fast": state.settings.model_fast,
         "model_fast_max_chars": state.settings.model_fast_max_chars,
+        "vision_model": state.settings.vision_model,
         "model_auto_min_free_mb": state.settings.model_auto_min_free_mb,
         "model_auto_keep_free_mb": state.settings.model_auto_keep_free_mb,
         "num_thread": state.settings.num_thread,
         "num_ctx": state.settings.num_ctx,
-        "providers": available_providers(),
+        "providers": [
+            name
+            for name in available_providers()
+            if name != "fake" or state.settings.provider == "fake"
+        ],
         "provider_base_url": state.settings.provider_base_url,
         "voice": {
             "stt_available": state.stt_engine is not None,

@@ -355,3 +355,77 @@ def test_agent_rejects_oversized_body_and_unbounded_params(monkeypatch, tmp_path
         too_many_params = client.post("/command", json=body, headers=headers)
     assert too_many_params.status_code == 422
     assert not (tmp_path / "journal.jsonl").exists()
+
+
+def test_opencode_action_requires_confirmation_and_parses_events(monkeypatch, tmp_path):
+    token = "o" * 40
+    monkeypatch.setattr(server, "_token", token)
+    monkeypatch.setattr(server, "_journal", tmp_path / "journal.jsonl")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    binary = tmp_path / "opencode"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setenv("CHAT_AGENT_ALLOWED_DIRS", str(workspace))
+    monkeypatch.setenv("CHAT_AGENT_WRITE_DIRS", str(workspace))
+    monkeypatch.setenv("CHAT_AGENT_OPENCODE_BIN", str(binary))
+    monkeypatch.setenv("CHAT_AGENT_OPENCODE_MODEL", "opencode/test-model")
+    monkeypatch.setenv("CHAT_AGENT_OPENCODE_SANDBOX", "0")
+    monkeypatch.setenv("CHAT_AGENT_TOKEN", token)
+    launched = {}
+
+    class Process:
+        returncode = 0
+
+        async def communicate(self):
+            return (
+                b'{"type":"tool_use","part":{"tool":"write","state":{"title":"write"}}}\n'
+                b'{"type":"text","part":{"text":"Arquivo criado com sucesso."}}\n',
+                b"",
+            )
+
+        async def wait(self):
+            return 0
+
+        def kill(self):
+            pass
+
+    async def fake_spawn(*argv, **kwargs):
+        launched["argv"] = argv
+        launched["cwd"] = kwargs.get("cwd")
+        launched["env"] = kwargs.get("env")
+        return Process()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_spawn)
+    headers = {"Authorization": f"Bearer {token}"}
+
+    def send(*, confirmed: bool):
+        return client.post(
+            "/command",
+            json={
+                "command_id": "aa33a807-46dc-4d58-9d0b-20c91e422f00",
+                "action": "opencode",
+                "params": {"prompt": "Crie um arquivo de teste"},
+                "requires_confirmation": confirmed,
+            },
+            headers=headers,
+        )
+
+    with TestClient(server.app) as client:
+        pending = send(confirmed=False)
+        assert pending.json()["status"] == "needs_confirmation"
+        assert not launched
+        done = send(confirmed=True)
+        assert done.json()["status"] == "ok"
+        assert "Arquivo criado com sucesso." in done.json()["message"]
+        assert "write" in done.json()["message"]
+        assert launched["cwd"] == workspace
+        assert launched["env"]["PWD"] == str(workspace)
+        assert launched["argv"][:2] == (str(binary), "run")
+        assert "--standalone" in launched["argv"]
+        assert "opencode/test-model" in launched["argv"]
+        assert not any(key.startswith("CHAT_AGENT_") for key in launched["env"])
+        assert "Crie um arquivo de teste" not in launched["env"].get("CHAT_AGENT_TOKEN", "")
+
+    journal = (tmp_path / "journal.jsonl").read_text()
+    assert "Crie um arquivo de teste" not in journal
+    assert "prompt_chars" in journal

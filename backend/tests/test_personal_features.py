@@ -89,13 +89,24 @@ def test_simple_prompt_heuristic():
     service = ChatService(
         Settings(provider="fake", model="fake-model"), None, FakeProvider()
     )  # type: ignore[arg-type]
-    assert service._is_simple_prompt("oi")
+    assert not service._is_simple_prompt("oi")
     assert service._is_simple_prompt("Explique o que é a taxa Selic em uma frase.")
-    assert service._is_simple_prompt("hoje eu estou meio cansado, quer conversar?")
+    assert not service._is_simple_prompt("hoje eu estou meio cansado, quer conversar?")
     assert not service._is_simple_prompt("Qual a cotação do dólar?")
     assert not service._is_simple_prompt("Pesquise notícias de hoje")
     assert not service._is_simple_prompt("Qual a previsão do tempo para hoje?")
     assert not service._is_simple_prompt("x" * 400)
+
+
+def test_direct_smalltalk_answers_without_model():
+    service = ChatService(
+        Settings(provider="fake", model="fake-model"), None, FakeProvider()
+    )  # type: ignore[arg-type]
+    assert service._direct_smalltalk_answer("Oi, tudo bem?")
+    assert service._direct_smalltalk_answer("Bom dia!")
+    assert service._direct_smalltalk_answer("Obrigado!")
+    assert service._direct_smalltalk_answer("Tchau!")
+    assert service._direct_smalltalk_answer("Quanto custa o dólar?") is None
 
 
 def test_strip_links_keeps_text_and_removes_urls():
@@ -189,6 +200,55 @@ async def test_sources_are_persisted_and_sent_in_done(tmp_path):
         await db.close()
 
 
+class _LengthProvider(FakeProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+        self.contexts = []
+
+    async def stream_events(self, messages, model, tools=None, options=None):
+        self.contexts.append(messages)
+        if self.calls == 0:
+            self.calls += 1
+            yield {"content": "Primeira parte, "}
+            yield {"done_reason": "length"}
+            return
+        yield {"content": "segunda parte."}
+        yield {"done_reason": "stop"}
+
+
+async def test_stream_continues_when_provider_hits_token_limit(tmp_path):
+    db = Database(str(tmp_path / "chat.db"))
+    await db.connect()
+    try:
+        provider = _LengthProvider()
+        service = ChatService(
+            Settings(provider="fake", model="fake-model"),
+            db,
+            provider,
+        )
+        events = [
+            event
+            async for event in service.stream_user_message(
+                "Escreva uma explicação longa sobre manutenção preventiva."
+            )
+        ]
+        done = events[-1]
+        assert done["type"] == "done"
+        assert done["content"] == "Primeira parte, segunda parte."
+        assert provider.calls == 1
+        second_context = provider.contexts[-1]
+        assert any(
+            message.role == "system" and "interrompida" in message.content
+            for message in second_context
+        )
+        stored = await service.store.get_messages(done["conversation_id"])
+        assistant = [row for row in stored if row["role"] == "assistant"][-1]
+        assert assistant["content"] == "Primeira parte, segunda parte."
+    finally:
+        await db.close()
+
+
 class _FastProvider(FakeProvider):
     def __init__(self) -> None:
         super().__init__()
@@ -209,8 +269,11 @@ async def test_fast_model_is_used_for_simple_prompts():
         None,  # type: ignore[arg-type]
         _FastProvider(),
     )
-    assert await service._select_model("oi") == "fast-model"
+    assert await service._select_model("Explique o que é a taxa Selic em uma frase.") == "fast-model"
     assert await service._select_model("Qual a cotação do dólar?") == "small-model"
+    # Conversa pessoal nunca usa o modelo rápido, que inventa intimidade.
+    assert await service._select_model("oi, tudo bem?") == "small-model"
+    assert await service._select_model("hoje eu estou cansado") == "small-model"
 
 
 def test_provider_options_use_threads_and_shorter_prediction():
@@ -219,8 +282,18 @@ def test_provider_options_use_threads_and_shorter_prediction():
     )  # type: ignore[arg-type]
     options = service._provider_options("small-model")
     assert options["num_thread"] == 6
-    assert options["num_predict"] == 384
-    assert options["num_ctx"] == 2048
+    assert options["num_predict"] == 1024
+    assert options["num_ctx"] == 8192
+    assert service._provider_options("small-model", simple=True)["num_predict"] == 512
+
+
+def test_personality_prompt_is_loaded_from_its_own_file():
+    settings = Settings()
+    assert "PERSONALIDADE E ESTILO DE COMUNICAÇÃO" in settings.system_prompt
+    assert "REGRAS DO APLICATIVO" in settings.system_prompt
+    assert "próximo e caloroso" not in settings.system_prompt.lower()
+    assert "Você é o assistente, não o usuário" in settings.system_prompt
+    assert "PERSONALIDADE E ESTILO" not in settings.system_prompt_fast
 
 
 def test_direct_currency_shortcut_avoids_provider(tmp_path, monkeypatch):

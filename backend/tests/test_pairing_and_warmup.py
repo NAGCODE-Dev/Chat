@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import chat.api.routes_pairing as routes_pairing
 from chat.agent_orchestration.chat_service import ChatService
 from chat.api.routes_pairing import _qr_payload
 from chat.core.config import Settings
@@ -34,6 +35,31 @@ def test_qr_payload_contains_code_and_all_candidate_urls():
     assert "code=codigo-seguro" in payload
     assert "url=http%3A%2F%2F100.97.209.46%3A8750" in payload
     assert "url=http%3A%2F%2F192.168.15.8%3A8750" in payload
+
+
+def test_pairing_status_returns_only_booleans(client, monkeypatch):
+    monkeypatch.setattr(
+        routes_pairing,
+        "_local_ipv4_addresses",
+        lambda: ["192.168.15.8"],
+    )
+    monkeypatch.setattr(
+        routes_pairing,
+        "_tailscale_status",
+        lambda: {"installed": True, "logged_in": True, "online": True},
+    )
+    response = client.get("/api/pairing/status")
+    assert response.status_code == 200
+    body = response.json()
+    assert body == {
+        "pairing_available": True,
+        "lan_available": True,
+        "tailscale_installed": True,
+        "tailscale_logged_in": True,
+        "tailscale_online": True,
+    }
+    assert "192.168" not in response.text
+    assert "100." not in response.text
 
 
 class _WarmProvider(FakeProvider):

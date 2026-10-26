@@ -20,6 +20,9 @@ void main() {
     SharedPreferences.setMockInitialValues({
       'backend_url': 'http://127.0.0.1:1',
     });
+    tester.view.physicalSize = const Size(1440, 900);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
     await tester.pumpWidget(ChatApp(tokenStore: _MemoryTokenStore()));
     await tester.pumpAndSettle();
 
@@ -45,6 +48,9 @@ void main() {
       'continuous_mode': true,
       'wake_word': 'jarvis',
     });
+    tester.view.physicalSize = const Size(1440, 900);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
     await tester.pumpWidget(ChatApp(tokenStore: _MemoryTokenStore()));
     await tester.pumpAndSettle();
 

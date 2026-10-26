@@ -159,6 +159,43 @@ MIGRATIONS: list[tuple[int, str]] = [
         ALTER TABLE messages ADD COLUMN sources_json TEXT;
         """,
     ),
+    (
+        6,
+        """
+        ALTER TABLE messages ADD COLUMN attachments_json TEXT;
+
+        CREATE TABLE IF NOT EXISTS attachments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            filename TEXT NOT NULL,
+            mime TEXT NOT NULL,
+            size INTEGER NOT NULL CHECK (size > 0),
+            kind TEXT NOT NULL CHECK (kind IN ('image','text','file')),
+            sha256 TEXT NOT NULL,
+            stored_name TEXT NOT NULL,
+            extracted_text TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_attachments_created
+            ON attachments(created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_attachments_sha ON attachments(sha256);
+        """,
+    ),
+    (
+        7,
+        """
+        CREATE TABLE IF NOT EXISTS ubuntu_tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            prompt TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'running'
+                CHECK (status IN ('running','ok','failed')),
+            output TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            finished_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_ubuntu_tasks_created
+            ON ubuntu_tasks(created_at DESC);
+        """,
+    ),
 ]
 
 

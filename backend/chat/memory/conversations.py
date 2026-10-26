@@ -21,11 +21,12 @@ class ConversationStore:
     async def add_message(
         self, conversation_id: int, role: str, content: str, tool_calls_json: str | None = None,
         tool_call_id: str | None = None, name: str | None = None,
-        sources_json: str | None = None,
+        sources_json: str | None = None, attachments_json: str | None = None,
     ) -> int:
         msg_id = await self.db.execute(
             "INSERT INTO messages(conversation_id, role, content, tool_calls_json, "
-            "tool_call_id, name, sources_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "tool_call_id, name, sources_json, attachments_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 conversation_id,
                 role,
@@ -34,6 +35,7 @@ class ConversationStore:
                 tool_call_id,
                 name,
                 sources_json,
+                attachments_json,
             ),
         )
         await self.db.execute(
@@ -52,15 +54,20 @@ class ConversationStore:
 
     async def list_conversations(self, limit: int = 50) -> list[dict]:
         return await self.db.fetch_all(
-            "SELECT id, title, created_at, updated_at FROM conversations "
-            "ORDER BY updated_at DESC LIMIT ?",
+            "SELECT c.id, c.title, c.created_at, c.updated_at, "
+            "(SELECT m.content FROM messages m "
+            " WHERE m.conversation_id = c.id "
+            "   AND m.role IN ('user','assistant') "
+            "   AND trim(m.content) <> '' "
+            " ORDER BY m.id DESC LIMIT 1) AS last_message "
+            "FROM conversations c ORDER BY c.updated_at DESC LIMIT ?",
             (limit,),
         )
 
     async def get_messages(self, conversation_id: int) -> list[dict]:
         rows = await self.db.fetch_all(
-            "SELECT id, role, content, created_at, name, tool_call_id, sources_json "
-            "FROM messages WHERE conversation_id = ? ORDER BY id",
+            "SELECT id, role, content, created_at, name, tool_call_id, sources_json, "
+            "attachments_json FROM messages WHERE conversation_id = ? ORDER BY id",
             (conversation_id,),
         )
         for row in rows:
@@ -74,6 +81,16 @@ class ConversationStore:
                     sources = [item for item in parsed if isinstance(item, dict)]
             row["sources"] = sources
             row.pop("sources_json", None)
+            attachments: list[dict] = []
+            if row.get("attachments_json"):
+                try:
+                    parsed = json.loads(row["attachments_json"])
+                except (TypeError, ValueError):
+                    parsed = []
+                if isinstance(parsed, list):
+                    attachments = [item for item in parsed if isinstance(item, dict)]
+            row["attachments"] = attachments
+            row.pop("attachments_json", None)
         return rows
 
     async def delete_conversation(self, conversation_id: int) -> None:

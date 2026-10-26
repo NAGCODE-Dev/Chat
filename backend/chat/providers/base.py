@@ -22,6 +22,8 @@ class Message:
     tool_calls: list[ToolCall] = field(default_factory=list)
     tool_call_id: str | None = None
     name: str | None = None
+    # Imagens em base64 para modelos com visão (formato nativo do Ollama).
+    images: list[str] = field(default_factory=list)
 
 
 @dataclass

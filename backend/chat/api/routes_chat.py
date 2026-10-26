@@ -60,6 +60,7 @@ class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=12_000)
     conversation_id: int | None = None
     device_context: str | None = Field(default=None, max_length=6000)
+    attachment_ids: list[int] = Field(default_factory=list, max_length=8)
 
 
 class ChatResponse(BaseModel):
@@ -87,7 +88,7 @@ async def chat(
 ) -> ChatResponse:
     try:
         turn: ChatTurn = await svc.handle_user_message(
-            req.message, req.conversation_id, req.device_context
+            req.message, req.conversation_id, req.device_context, req.attachment_ids
         )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
@@ -126,7 +127,7 @@ async def stream_chat(websocket: WebSocket) -> None:
             req = ChatRequest.model_validate(payload)
             svc = get_chat_service()
             events = svc.stream_user_message(
-                req.message, req.conversation_id, req.device_context
+                req.message, req.conversation_id, req.device_context, req.attachment_ids
             )
             event = await anext(events)
             while True:

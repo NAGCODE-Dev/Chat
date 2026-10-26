@@ -22,7 +22,7 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.text('Como posso ajudar?'), findsOneWidget);
-    expect(find.text('Escreva uma mensagem'), findsOneWidget);
+    expect(find.text('Sem conexão com o notebook'), findsOneWidget);
   });
 
   testWidgets('token é entregue ao cofre e não às preferências', (
@@ -35,7 +35,11 @@ void main() {
     await tester.pumpWidget(ChatApp(tokenStore: tokenStore));
     await tester.pumpAndSettle();
 
-    await tester.tap(find.byTooltip('Configurar conexão'));
+    await tester.tap(find.byTooltip('Histórico de conversas'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Configurações'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Endereço e token'));
     await tester.pumpAndSettle();
     await tester.enterText(find.byType(TextField).last, 'secret-test-token');
     await tester.tap(find.text('Salvar'));
@@ -45,5 +49,49 @@ void main() {
     final preferences = await SharedPreferences.getInstance();
     expect(preferences.getKeys(), {'backend_url'});
     expect(preferences.getString('api_token'), isNull);
+  });
+
+  testWidgets('endereço do backend fica fora das telas normais', (
+    tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({
+      'backend_url': 'http://192.168.15.8:8750',
+    });
+    await tester.pumpWidget(ChatApp(tokenStore: _MemoryTokenStore()));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('192.168.15.8'), findsNothing);
+
+    await tester.tap(find.byTooltip('Histórico de conversas'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Configurações'));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('192.168.15.8'), findsNothing);
+
+    // O diálogo avançado ainda permite ajustar a conexão manualmente.
+    await tester.tap(find.text('Endereço e token'));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('192.168.15.8'), findsOneWidget);
+  });
+
+  testWidgets('token em branco preserva o valor já salvo', (tester) async {
+    SharedPreferences.setMockInitialValues({
+      'backend_url': 'http://127.0.0.1:1',
+    });
+    final tokenStore = _MemoryTokenStore()..value = 'existing-token';
+    await tester.pumpWidget(ChatApp(tokenStore: tokenStore));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byTooltip('Histórico de conversas'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Configurações'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Endereço e token'));
+    await tester.pumpAndSettle();
+
+    final tokenField = tester.widget<TextField>(find.byType(TextField).last);
+    expect(tokenField.controller?.text, isEmpty);
+    await tester.tap(find.text('Salvar'));
+    await tester.pumpAndSettle();
+    expect(tokenStore.value, 'existing-token');
   });
 }

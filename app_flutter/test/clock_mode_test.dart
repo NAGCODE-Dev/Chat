@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -31,6 +32,9 @@ void main() {
       'hibernation_minutes': 5,
       'clock_24h': true,
     });
+    tester.view.physicalSize = const Size(1440, 900);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
     await tester.pumpWidget(
       ChatApp(tokenStore: _MemoryTokenStore(), screenAwake: NoopScreenAwake()),
     );
@@ -42,7 +46,52 @@ void main() {
 
     await tester.tap(find.text('Toque na tela para conversar'));
     await tester.pumpAndSettle();
-    expect(find.text('Escreva uma mensagem'), findsOneWidget);
+    expect(find.text('Sem conexão com o notebook'), findsOneWidget);
+
+    await tester.pumpWidget(const SizedBox());
+  });
+
+  testWidgets('F11 alterna tela cheia sem sair do relógio', (tester) async {
+    SharedPreferences.setMockInitialValues({
+      'backend_url': 'http://127.0.0.1:1',
+      'clock_mode_enabled': true,
+      'hibernation_minutes': 5,
+      'clock_24h': true,
+    });
+    tester.view.physicalSize = const Size(1440, 900);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+    const channel = MethodChannel('chat/window');
+    final calls = <MethodCall>[];
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(channel, (
+      call,
+    ) async {
+      calls.add(call);
+      return null;
+    });
+    addTearDown(
+      () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        channel,
+        null,
+      ),
+    );
+    await tester.pumpWidget(
+      ChatApp(tokenStore: _MemoryTokenStore(), screenAwake: NoopScreenAwake()),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('F11 alterna a tela cheia'), findsOneWidget);
+
+    await tester.sendKeyEvent(LogicalKeyboardKey.f11);
+    await tester.pumpAndSettle();
+    expect(calls, isNotEmpty);
+    expect(calls.last.method, 'setFullscreen');
+    expect(calls.last.arguments, isTrue);
+    expect(_clockText(), findsOneWidget);
+
+    await tester.sendKeyEvent(LogicalKeyboardKey.f11);
+    await tester.pumpAndSettle();
+    expect(calls.last.arguments, isFalse);
+    expect(_clockText(), findsOneWidget);
 
     await tester.pumpWidget(const SizedBox());
   });
@@ -56,6 +105,9 @@ void main() {
       'hibernation_minutes': 1,
       'clock_24h': true,
     });
+    tester.view.physicalSize = const Size(1440, 900);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
     await tester.pumpWidget(
       ChatApp(tokenStore: _MemoryTokenStore(), screenAwake: NoopScreenAwake()),
     );
@@ -64,7 +116,7 @@ void main() {
 
     await tester.tap(find.byKey(const Key('clock-screen')));
     await tester.pumpAndSettle();
-    expect(find.text('Escreva uma mensagem'), findsOneWidget);
+    expect(find.text('Sem conexão com o notebook'), findsOneWidget);
 
     await tester.pump(const Duration(minutes: 1));
     await tester.pumpAndSettle();
@@ -79,6 +131,9 @@ void main() {
     SharedPreferences.setMockInitialValues({
       'backend_url': 'http://127.0.0.1:1',
     });
+    tester.view.physicalSize = const Size(1440, 900);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
     await tester.pumpWidget(
       ChatApp(tokenStore: _MemoryTokenStore(), screenAwake: NoopScreenAwake()),
     );

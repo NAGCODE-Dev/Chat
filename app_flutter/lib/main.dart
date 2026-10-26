@@ -10,16 +10,33 @@ import 'package:record/record.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
+import 'app/app_section.dart';
+import 'app/shell/app_shell.dart';
+import 'app/theme/app_palette.dart';
+import 'app/theme/app_theme.dart';
+import 'app/widgets/app_logo.dart';
+import 'core/attachment_picker.dart';
 import 'core/backend_client.dart';
 import 'core/clock_format.dart';
 import 'core/conversation_mode.dart';
 import 'core/screen_awake.dart';
 import 'core/theme_controller.dart';
 import 'core/token_store.dart';
+import 'features/chat/models/chat_models.dart';
+import 'features/chat/widgets/chat_message_bubble.dart';
+import 'features/chat/widgets/empty_chat_view.dart';
+import 'features/chat/widgets/message_composer.dart';
+import 'features/chat/widgets/model_selector.dart';
+import 'features/computer/computer_page.dart';
+import 'features/explore/explore_page.dart';
+import 'features/files/files_page.dart';
+import 'features/pairing/pairing_qr_dialog.dart';
+import 'features/settings/settings_page.dart';
 import 'phone_assistant_page.dart';
 
 const _audioChannel = MethodChannel('chat/audio');
 const _deviceChannel = MethodChannel('chat/device');
+const _windowChannel = MethodChannel('chat/window');
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -33,22 +50,14 @@ class ChatApp extends StatelessWidget {
   final TokenStore? tokenStore;
   final ScreenAwake? screenAwake;
 
-  static ThemeData _theme(Brightness brightness) => ThemeData(
-    colorScheme: ColorScheme.fromSeed(
-      seedColor: const Color(0xFF365D8D),
-      brightness: brightness,
-    ),
-    useMaterial3: true,
-  );
-
   @override
   Widget build(BuildContext context) => AnimatedBuilder(
     animation: themeController,
     builder: (context, _) => MaterialApp(
       title: 'Chat',
       debugShowCheckedModeBanner: false,
-      theme: _theme(Brightness.light),
-      darkTheme: _theme(Brightness.dark),
+      theme: buildAppTheme(Brightness.light),
+      darkTheme: buildAppTheme(Brightness.dark),
       themeMode: themeController.mode,
       home: ChatPage(tokenStore: tokenStore, screenAwake: screenAwake),
     ),
@@ -69,9 +78,11 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
   static const _defaultUrl = 'http://127.0.0.1:8750';
   final _input = TextEditingController();
   final _scroll = ScrollController();
+  final _composerFocus = FocusNode();
   final _recorder = AudioRecorder();
   Process? _audioPlaybackProcess;
-  List<_ChatMessage> _messages = [];
+  List<ChatMessage> _messages = [];
+  List<ChatAttachment> _pendingAttachments = [];
   final List<_ChatRun> _runs = [];
   final Set<int> _busyConversations = {};
   List<Map<String, dynamic>> _conversations = [];
@@ -79,10 +90,19 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
   String? _backendToken;
   String? _error;
   int? _conversationId;
+  AppSection _section = AppSection.chat;
+  String _historySearch = '';
+  String _provider = '';
+  String _model = '';
+  String? _visionModel;
+  List<Map<String, dynamic>> _models = [];
+  bool _modelsLoading = false;
   String _greeting = 'Como posso ajudar?';
   int _memoryCount = 0;
   bool _offline = false;
   bool _loading = true;
+  bool _conversationsLoading = true;
+  bool _uploadingAttachment = false;
   bool _recording = false;
   bool _speaking = false;
   bool _sttAvailable = false;
@@ -109,6 +129,7 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
   String? _notificationsCache;
   bool _clockModeEnabled = false;
   bool _clockMode = false;
+  bool _desktopFullscreen = false;
   bool _clock24h = true;
   int _hibernationMinutes = 5;
   DateTime _clockNow = DateTime.now();
@@ -162,6 +183,7 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     unawaited(_loadGreeting());
     unawaited(_refreshVoiceStatus());
     unawaited(_refreshDeviceStatus());
+    unawaited(_refreshModelInfo());
     unawaited(_warmupModels());
     if (_clockModeEnabled) {
       await _enterClockMode();
@@ -174,13 +196,15 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
   }
 
   @override
-  @override
   void didChangeMetrics() {
-    // O teclado muda a altura da lista; rolar só no token deixa a resposta
-    // longa alguns pixels acima do fim. Recalcula quando a animação termina.
+    // Acompanha o teclado desde o primeiro frame. Antes, a lista só era
+    // reposicionada 260 ms depois, o que produzia um salto no fim da animação.
     _metricsScrollTimer?.cancel();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _scrollToEnd(force: true);
+    });
     _metricsScrollTimer = Timer(const Duration(milliseconds: 260), () {
-      if (mounted) _scrollToEnd();
+      if (mounted) _scrollToEnd(force: true);
     });
   }
 
@@ -244,6 +268,7 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
   Future<void> _leaveClockMode() async {
     if (!_clockMode) return;
     _clockTimer?.cancel();
+    if (_desktopFullscreen) unawaited(_setDesktopFullscreen(false));
     setState(() {
       _clockMode = false;
       _clockNow = DateTime.now();
@@ -336,6 +361,20 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     }
   }
 
+  Future<void> _setDesktopFullscreen(bool value) async {
+    if (!_supportsClockMode) return;
+    try {
+      await _windowChannel.invokeMethod<void>('setFullscreen', value);
+    } catch (_) {
+      // Canal ausente em Android, testes ou outros desktops.
+      return;
+    }
+    if (mounted) setState(() => _desktopFullscreen = value);
+  }
+
+  Future<void> _toggleDesktopFullscreen() =>
+      _setDesktopFullscreen(!_desktopFullscreen);
+
   Widget _buildClockScreen() {
     return Scaffold(
       backgroundColor: Colors.black,
@@ -346,6 +385,12 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
         child: Focus(
           autofocus: true,
           onKeyEvent: (node, event) {
+            if (event is KeyDownEvent &&
+                event.logicalKey == LogicalKeyboardKey.f11) {
+              // F11 alterna a tela cheia sem sair do relógio.
+              unawaited(_toggleDesktopFullscreen());
+              return KeyEventResult.handled;
+            }
             if (event is KeyDownEvent) {
               unawaited(_leaveClockMode());
               return KeyEventResult.handled;
@@ -407,6 +452,17 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
                               letterSpacing: 0.4,
                             ),
                           ),
+                          if (Platform.isLinux) ...[
+                            const SizedBox(height: 10),
+                            Text(
+                              'F11 alterna a tela cheia',
+                              style: TextStyle(
+                                color: Colors.white.withValues(alpha: 0.32),
+                                fontSize: 12,
+                                letterSpacing: 0.3,
+                              ),
+                            ),
+                          ],
                         ],
                       ),
                     ),
@@ -460,12 +516,14 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
       setState(() {
         _conversations = conversations;
         _offline = false;
+        _conversationsLoading = false;
       });
       await _cacheConversations(conversations);
     } catch (error) {
       if (!mounted) return;
       setState(() {
         _offline = true;
+        _conversationsLoading = false;
         if (_conversations.isEmpty) {
           _error = _friendlyError(error);
         }
@@ -579,6 +637,220 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     } catch (_) {
       // Aquecimento é melhor esforço: não atrapalha a abertura do app.
     }
+  }
+
+  Future<void> _refreshModelInfo() async {
+    try {
+      final settings = await _client.settings();
+      if (!mounted) return;
+      final provider = (settings['provider'] as String? ?? '').trim();
+      final model = (settings['model'] as String? ?? '').trim();
+      setState(() {
+        _provider = provider;
+        _model = model;
+        _visionModel = (settings['vision_model'] as String?)?.trim();
+      });
+      if (provider.isNotEmpty) {
+        await _loadModels(provider);
+      }
+    } catch (_) {
+      // O seletor mostra o estado vazio; o chat continua utilizável.
+    }
+  }
+
+  Future<void> _loadModels(String provider) async {
+    if (provider.isEmpty) return;
+    if (mounted) setState(() => _modelsLoading = true);
+    try {
+      final models = await _client.models(provider);
+      if (!mounted || provider != _provider) return;
+      setState(() => _models = models);
+    } catch (_) {
+      if (!mounted) return;
+      setState(() => _models = []);
+    } finally {
+      if (mounted) setState(() => _modelsLoading = false);
+    }
+  }
+
+  Future<void> _selectModel(String model) async {
+    if (_provider.isEmpty || model.trim().isEmpty) return;
+    try {
+      await _client.updateModel(_provider, model.trim());
+      if (!mounted) return;
+      setState(() => _model = model.trim());
+      unawaited(_warmupModels());
+      ScaffoldMessenger.of(context)
+          .showSnackBar(const SnackBar(content: Text('Modelo atualizado.')));
+    } catch (error) {
+      if (mounted) _showError(error);
+    }
+  }
+
+  Future<void> _openModelSettings() async {
+    await Navigator.push<void>(
+      context,
+      MaterialPageRoute(builder: (_) => _ModelSettingsPage(client: _client)),
+    );
+    if (mounted) await _refreshModelInfo();
+  }
+
+  Future<void> _testConnection() async {
+    try {
+      final health = await _client.health();
+      if (!mounted) return;
+      setState(() => _offline = false);
+      final provider = (health['provider'] as String? ?? '').trim();
+      final model = (health['model'] as String? ?? '').trim();
+      final healthy = health['provider_healthy'] == true;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            healthy
+                ? 'Backend respondeu · ${provider.isEmpty ? 'provider' : provider}'
+                      '${model.isEmpty ? '' : ' · $model'}'
+                : 'Backend respondeu, mas o provider não está saudável.',
+          ),
+        ),
+      );
+    } catch (error) {
+      if (!mounted) return;
+      setState(() => _offline = true);
+      _showError(error);
+    }
+  }
+
+  Future<void> _pickAttachment({required bool imagesOnly}) async {
+    if (_offline) {
+      _showError(
+        'Sem conexão com o notebook. Verifique a rede e tente de novo.',
+      );
+      return;
+    }
+    try {
+      final picked = await pickAttachment(imagesOnly: imagesOnly);
+      if (picked == null) return;
+      if (!mounted) return;
+      setState(() => _uploadingAttachment = true);
+      final metadata = await _client.uploadAttachment(
+        picked.name,
+        picked.bytes,
+        mime: picked.mime,
+      );
+      final attachment = ChatAttachment.fromJson(metadata)
+          .copyWith(bytes: picked.bytes);
+      if (!mounted) return;
+      setState(() => _pendingAttachments.add(attachment));
+    } catch (error) {
+      if (mounted) _showError(error);
+    } finally {
+      if (mounted) setState(() => _uploadingAttachment = false);
+    }
+  }
+
+  void _removePendingAttachment(ChatAttachment attachment) {
+    final id = attachment.id;
+    setState(
+      () => _pendingAttachments.removeWhere((item) => item == attachment),
+    );
+    if (id == null) return;
+    unawaited(
+      _client.deleteAttachment(id).catchError((Object _) {
+        // O anexo pode já ter sido removido; o envio não depende disso.
+      }),
+    );
+  }
+
+  Future<Uint8List?> _loadAttachmentBytes(ChatAttachment attachment) async {
+    final bytes = attachment.bytes;
+    if (bytes != null) return bytes;
+    final id = attachment.id;
+    if (id == null) return null;
+    try {
+      return await _client.attachmentBytes(id);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> _insertLink() async {
+    final urlController = TextEditingController();
+    final labelController = TextEditingController();
+    final value = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Inserir link'),
+        content: SizedBox(
+          width: 420,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                controller: labelController,
+                autofocus: true,
+                decoration: const InputDecoration(labelText: 'Texto do link'),
+              ),
+              const SizedBox(height: 10),
+              TextField(
+                controller: urlController,
+                keyboardType: TextInputType.url,
+                decoration: const InputDecoration(
+                  labelText: 'Endereço',
+                  hintText: 'https://…',
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancelar'),
+          ),
+          FilledButton(
+            onPressed: () {
+              final url = urlController.text.trim();
+              if (url.isEmpty) return;
+              final label = labelController.text.trim();
+              Navigator.pop(context, label.isEmpty ? url : '[$label]($url)');
+            },
+            child: const Text('Inserir'),
+          ),
+        ],
+      ),
+    );
+    urlController.dispose();
+    labelController.dispose();
+    if (value == null || !mounted) return;
+    final selection = _input.selection;
+    final text = _input.text;
+    final start = selection.start < 0 ? text.length : selection.start;
+    final end = selection.end < 0 ? text.length : selection.end;
+    _input.value = TextEditingValue(
+      text: '${text.substring(0, start)}$value${text.substring(end)}',
+      selection: TextSelection.collapsed(offset: start + value.length),
+    );
+    _composerFocus.requestFocus();
+  }
+
+  void _setSection(AppSection section) {
+    if (_section == section) return;
+    setState(() => _section = section);
+    if (section == AppSection.chat) {
+      unawaited(_refreshConversations());
+    }
+  }
+
+  String get _conversationTitle {
+    final id = _conversationId;
+    if (id == null) return 'Nova conversa';
+    for (final conversation in _conversations) {
+      if ((conversation['id'] as num?)?.toInt() == id) {
+        final title = (conversation['title'] as String? ?? '').trim();
+        return title.isEmpty ? 'Conversa' : title;
+      }
+    }
+    return 'Conversa';
   }
 
   Future<void> _refreshDeviceStatus() async {
@@ -710,37 +982,6 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     await _refreshDeviceStatus();
   }
 
-  Future<void> _showThemePicker() async {
-    final selected = await showDialog<ThemeMode>(
-      context: context,
-      builder: (context) => SimpleDialog(
-        title: const Text('Tema'),
-        children: [
-          for (final mode in ThemeMode.values)
-            ListTile(
-              leading: Icon(switch (mode) {
-                ThemeMode.light => Icons.light_mode_outlined,
-                ThemeMode.dark => Icons.dark_mode_outlined,
-                ThemeMode.system => Icons.brightness_auto_outlined,
-              }),
-              title: Text(switch (mode) {
-                ThemeMode.light => 'Claro',
-                ThemeMode.dark => 'Escuro',
-                ThemeMode.system => 'Seguir o sistema',
-              }),
-              trailing: themeController.mode == mode
-                  ? const Icon(Icons.check)
-                  : null,
-              onTap: () => Navigator.pop(context, mode),
-            ),
-        ],
-      ),
-    );
-    if (selected != null) {
-      await themeController.setMode(selected);
-    }
-  }
-
   _ChatRun? _runForConversation(int id) {
     for (final run in _runs) {
       if (run.conversationId == id) return run;
@@ -750,14 +991,14 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
 
   /// Histórico visível: só falas do usuário e respostas finais. Chamadas de
   /// ferramenta e respostas vazias de turnos interrompidos não viram bolha.
-  List<_ChatMessage> _messagesFromRows(List<Map<String, dynamic>> rows) {
-    final messages = <_ChatMessage>[];
+  List<ChatMessage> _messagesFromRows(List<Map<String, dynamic>> rows) {
+    final messages = <ChatMessage>[];
     for (final row in rows) {
       final role = row['role'] as String? ?? '';
       if (role != 'user' && role != 'assistant') continue;
       final content = row['content'] as String? ?? '';
       if (role == 'assistant' && content.trim().isEmpty) continue;
-      messages.add(_ChatMessage.fromJson(row));
+      messages.add(ChatMessage.fromJson(row));
     }
     return messages;
   }
@@ -771,7 +1012,6 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
         _loading = false;
         _error = null;
       });
-      Navigator.pop(context);
       _scrollToEnd();
       return;
     }
@@ -789,7 +1029,6 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
       });
       await _cacheMessages(id, rows);
       if (!mounted || _conversationId != id) return;
-      Navigator.pop(context);
       _scrollToEnd();
     } catch (error) {
       if (!mounted || _conversationId != id) return;
@@ -800,7 +1039,6 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
         _offline = true;
         if (cached.isEmpty) _error = _friendlyError(error);
       });
-      Navigator.pop(context);
       _scrollToEnd();
     } finally {
       if (mounted && _conversationId == id) {
@@ -816,7 +1054,6 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
       _error = null;
       _loading = false;
     });
-    Navigator.pop(context);
     unawaited(_loadGreeting());
   }
 
@@ -871,7 +1108,8 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
 
   Future<void> _send() async {
     final text = _input.text.trim();
-    if (text.isEmpty || _busy) return;
+    final attachments = List<ChatAttachment>.from(_pendingAttachments);
+    if ((text.isEmpty && attachments.isEmpty) || _busy) return;
     if (_offline) {
       _showError(
         'Sem conexão com o notebook. Verifique a rede e tente de novo.',
@@ -887,8 +1125,18 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     final run = _ChatRun(messages: target, assistantIndex: target.length + 1);
     setState(() {
       _error = null;
-      target.add(_ChatMessage(role: 'user', content: text));
-      target.add(const _ChatMessage(role: 'assistant', content: ''));
+      _pendingAttachments = [];
+      target.add(
+        ChatMessage(
+          role: 'user',
+          content: text,
+          attachments: attachments,
+          createdAt: DateTime.now(),
+        ),
+      );
+      target.add(
+        ChatMessage(role: 'assistant', content: '', createdAt: DateTime.now()),
+      );
       _runs.add(run);
     });
     _scrollToEnd(force: true);
@@ -903,9 +1151,10 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
       if (!mounted || run.assistantIndex >= target.length) return;
       setState(() {
         final previous = target[run.assistantIndex].content;
-        target[run.assistantIndex] = _ChatMessage(
+        target[run.assistantIndex] = ChatMessage(
           role: 'assistant',
           content: '$previous$chunk',
+          createdAt: target[run.assistantIndex].createdAt,
         );
       });
       if (identical(_messages, target)) _scrollToEnd();
@@ -924,7 +1173,7 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     final pendingActions = <Map<String, dynamic>>[];
     try {
       channel = _client.connectChat();
-      final ready = channel.ready.timeout(const Duration(seconds: 8));
+      final ready = channel.ready.timeout(const Duration(seconds: 20));
       final deviceContext = await deviceContextFuture;
       await ready;
       channel.sink.add(
@@ -933,6 +1182,11 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
           if (_conversationId != null) 'conversation_id': _conversationId,
           if (deviceContext != null && deviceContext.isNotEmpty)
             'device_context': deviceContext,
+          if (attachments.isNotEmpty)
+            'attachment_ids': [
+              for (final attachment in attachments)
+                if (attachment.id != null) attachment.id,
+            ],
         }),
       );
       await for (final raw in channel.stream) {
@@ -949,6 +1203,7 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
                 _conversations.insert(0, {
                   'id': id,
                   'title': (event['title'] as String? ?? text).trim(),
+                  'last_message': text,
                   'updated_at': DateTime.now().toIso8601String(),
                 });
               }
@@ -967,17 +1222,18 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
             completed = true;
             final id = event['conversation_id'] as int? ?? run.conversationId;
             run.conversationId = id;
-            final sources = _parseSources(event['sources']);
+            final sources = ChatSource.parseList(event['sources']);
             final streamed = target[run.assistantIndex].content;
             final finalContent = (event['content'] as String?)?.trim();
             final reply = finalContent != null && finalContent.isNotEmpty
                 ? finalContent
                 : streamed;
             setState(() {
-              target[run.assistantIndex] = _ChatMessage(
+              target[run.assistantIndex] = ChatMessage(
                 role: 'assistant',
                 content: reply,
                 sources: sources,
+                createdAt: target[run.assistantIndex].createdAt,
               );
               if (id != null) _busyConversations.remove(id);
               if (identical(_messages, target) && _conversationId == null) {
@@ -1018,6 +1274,9 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
         setState(() {
           if (run.assistantIndex < target.length) {
             target.removeAt(run.assistantIndex);
+          }
+          if (run.conversationId == null && attachments.isNotEmpty) {
+            _pendingAttachments = attachments;
           }
           if (identical(_messages, target)) {
             _error = _friendlyError(error);
@@ -1140,6 +1399,9 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
       'append_file' =>
         'Acrescentar ${content is String ? content.length : 0} caracteres ao final de $path.',
       'create_dir' => 'Criar a pasta $path.',
+      'opencode' =>
+        'Executar esta tarefa no notebook com OpenCode: '
+            '${arguments['prompt'] ?? ''}',
       _ => 'Permitir esta ação no notebook: $arguments',
     };
   }
@@ -1645,7 +1907,12 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
       ),
     );
     if (value == null || value.$1.trim().isEmpty) return;
-    await _applyConnection(value.$1, value.$2);
+    // Campo em branco mantém o token atual; só um valor novo o substitui.
+    final typedToken = value.$2?.trim();
+    final token = typedToken == null || typedToken.isEmpty
+        ? _backendToken
+        : typedToken;
+    await _applyConnection(value.$1, token);
   }
 
   Future<bool> _applyConnection(String rawUrl, String? rawToken) async {
@@ -1683,6 +1950,11 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
   }
 
   Future<void> _openQrPairing() async {
+    if (!Platform.isAndroid && !Platform.isIOS) {
+      // No computador o Chat gera o QR; o celular apenas lê.
+      await showPairingQrDialog(context, _client);
+      return;
+    }
     final raw = await Navigator.of(
       context,
     ).push<String>(MaterialPageRoute(builder: (_) => const _QrPairingPage()));
@@ -1725,13 +1997,23 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
         .showSnackBar(SnackBar(content: Text(_friendlyError(error))));
   }
 
-  String _friendlyError(Object error) => error
-      .toString()
-      .replaceFirst('Exception: ', '')
-      .replaceFirst(
-        'ClientException: ',
-        'Não foi possível acessar o backend: ',
-      );
+  String _friendlyError(Object error) {
+    if (error is BackendException) return error.message;
+    if (error is TimeoutException) {
+      return 'O notebook demorou para responder. Verifique a conexão e tente de novo.';
+    }
+    if (error is SocketException) {
+      return 'Não foi possível alcançar o notebook. Verifique se ele está ligado e na mesma rede.';
+    }
+    return error
+        .toString()
+        .replaceFirst('Exception: ', '')
+        .replaceFirst(
+          'ClientException: ',
+          'Não foi possível acessar o backend: ',
+        )
+        .replaceFirst('TimeoutException after ', 'Tempo esgotado após ');
+  }
 
   bool _isStreamingIndex(int index) => _runs.any(
     (run) => identical(run.messages, _messages) && run.assistantIndex == index,
@@ -1762,9 +2044,17 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     _metricsScrollTimer?.cancel();
     _hibernationTimer?.cancel();
     _clockTimer?.cancel();
+    if (_desktopFullscreen) {
+      unawaited(
+        _windowChannel
+            .invokeMethod<void>('setFullscreen', false)
+            .catchError((Object _) {}),
+      );
+    }
     unawaited(_screenAwake.disable());
     _input.dispose();
     _scroll.dispose();
+    _composerFocus.dispose();
     unawaited(_stopPlayback());
     unawaited(_removeSpeechFile());
     if (_linuxRecorder != null) unawaited(_stopCapture());
@@ -1786,99 +2076,330 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
   @override
   Widget build(BuildContext context) {
     if (_clockMode) return _buildClockScreen();
-    return Scaffold(
-      // O corpo é levantado por _KeyboardAwareBody. Assim só o Padding do
-      // teclado é reconstruído, em vez de rebuildar a lista inteira a cada
-      // frame da animação do teclado.
-      resizeToAvoidBottomInset: false,
-      appBar: AppBar(
-        title: const Text('Chat'),
-        actions: [
-          IconButton(
-            tooltip: 'Conversa contínua',
-            onPressed: _showVoicePreferences,
-            color: _continuousMode
-                ? Theme.of(context).colorScheme.primary
-                : null,
-            icon: Icon(
-              _continuousMode ? Icons.hearing : Icons.hearing_outlined,
-            ),
-          ),
-          IconButton(
-            tooltip: _muted
-                ? 'Ativar respostas faladas'
-                : 'Silenciar respostas',
-            onPressed: _toggleMuted,
-            color: _muted ? Theme.of(context).colorScheme.primary : null,
-            icon: Icon(_muted ? Icons.volume_off : Icons.volume_up),
-          ),
-          if (_supportsClockMode)
-            IconButton(
-              tooltip: 'Modo relógio',
-              onPressed: _showClockPreferences,
-              color: _clockModeEnabled
-                  ? Theme.of(context).colorScheme.primary
-                  : null,
-              icon: Icon(
-                _clockModeEnabled ? Icons.schedule : Icons.schedule_outlined,
-              ),
-            ),
-          if (Platform.isAndroid || Platform.isIOS)
-            IconButton(
-              tooltip: 'Parear com QR code',
-              onPressed: _openQrPairing,
-              icon: const Icon(Icons.qr_code_scanner),
-            ),
-          IconButton(
-            tooltip: 'Configurar conexão',
-            onPressed: _showSettings,
-            icon: const Icon(Icons.settings_outlined),
-          ),
-        ],
+    return AppShell(
+      section: _section,
+      onSection: _setSection,
+      conversations: _conversations,
+      selectedConversationId: _conversationId,
+      busyConversationIds: _busyConversations,
+      conversationsLoading: _conversationsLoading,
+      search: _historySearch,
+      onSearchChanged: (value) => setState(() => _historySearch = value),
+      onSelectConversation: (id) => unawaited(_openConversation(id)),
+      onDeleteConversation: (id) => unawaited(_deleteConversation(id)),
+      onNewConversation: _newConversation,
+      builder: _buildSection,
+      connected: !_offline,
+      onVoice: _toggleVoice,
+      voiceActive: _recording || _speaking,
+      busy: _busy,
+    );
+  }
+
+  Widget _buildSection(
+    BuildContext context,
+    bool compact,
+    VoidCallback openHistory,
+  ) {
+    return switch (_section) {
+      AppSection.chat => _buildChatSection(context, compact, openHistory),
+      AppSection.explore => ExplorePage(
+        client: _client,
+        connected: !_offline,
+        conversationCount: _conversations.length,
+        isAndroid: Platform.isAndroid,
+        supportsClock: _supportsClockMode,
+        assistantEnabled: _isAssistant,
+        notificationsEnabled: _hasNotificationAccess,
+        onOpenFeature: (feature) {
+          unawaited(_openFeature(feature));
+        },
+        onOpenFinance: () {
+          unawaited(_openFinance());
+        },
+        onOpenComputer: () => _setSection(AppSection.computer),
+        onOpenFiles: () => _setSection(AppSection.files),
+        onOpenSettings: () => _setSection(AppSection.settings),
+        onOpenPhoneAssistant: () {
+          unawaited(_openPhoneAssistant());
+        },
+        onOpenQr: () {
+          unawaited(_openQrPairing());
+        },
+        onOpenClock: () {
+          unawaited(_showClockPreferences());
+        },
+        onRetry: () {
+          unawaited(_refreshConversations());
+        },
       ),
-      drawer: _buildDrawer(),
-      body: SafeArea(
-        top: true,
-        bottom: false,
-        left: false,
-        right: false,
-        child: Listener(
-          onPointerDown: (_) => _noteInteraction(),
-          child: _KeyboardAwareBody(
-            child: Column(
-              children: [
-                if (_continuousMode) _buildContinuousStatus(),
-                if (_loading) const LinearProgressIndicator(minHeight: 2),
-                if (_offline)
-                  MaterialBanner(
-                    leading: const Icon(Icons.cloud_off_outlined),
-                    content: const Text(
-                      'Sem conexão com o notebook. Mostrando conversas salvas; '
-                      'o envio fica indisponível até a conexão voltar.',
-                    ),
-                    actions: [
-                      TextButton(
-                        onPressed: () => unawaited(_refreshConversations()),
-                        child: const Text('Tentar de novo'),
-                      ),
-                    ],
-                  ),
-                if (_error != null)
-                  _ErrorBanner(
-                    message: _error!,
-                    onDismiss: () => setState(() => _error = null),
-                  ),
-                Expanded(child: _buildMessages()),
-                _buildComposer(),
-              ],
-            ),
-          ),
+      AppSection.files => FilesPage(
+        client: _client,
+        connected: !_offline,
+        onOpenInChat: _useAttachmentInChat,
+      ),
+      AppSection.settings => SettingsPage(
+        client: _client,
+        connected: !_offline,
+        provider: _provider,
+        model: _model,
+        visionModel: _visionModel,
+        sttAvailable: _sttAvailable,
+        ttsAvailable: _ttsAvailable,
+        muted: _muted,
+        continuousMode: _continuousMode,
+        themeMode: themeController.mode,
+        memoryCount: _memoryCount,
+        conversationCount: _conversations.length,
+        isAndroid: Platform.isAndroid,
+        isAssistant: _isAssistant,
+        hasNotificationAccess: _hasNotificationAccess,
+        supportsClock: _supportsClockMode,
+        clockEnabled: _clockModeEnabled,
+        onEditConnection: () {
+          unawaited(_showSettings());
+        },
+        onTestConnection: () {
+          unawaited(_testConnection());
+        },
+        onThemeMode: (mode) {
+          unawaited(themeController.setMode(mode));
+        },
+        onModelSettings: () {
+          unawaited(_openModelSettings());
+        },
+        onVoicePreferences: () {
+          unawaited(_showVoicePreferences());
+        },
+        onToggleMuted: () {
+          unawaited(_toggleMuted());
+        },
+        onClockPreferences: () {
+          unawaited(_showClockPreferences());
+        },
+        onOpenQr: () {
+          unawaited(_openQrPairing());
+        },
+        onOpenPhoneAssistant: () {
+          unawaited(_openPhoneAssistant());
+        },
+        onOpenComputer: () => _setSection(AppSection.computer),
+        onOpenFiles: () => _setSection(AppSection.files),
+        onOpenFinance: () {
+          unawaited(_openFinance());
+        },
+        onOpenFeature: (feature) {
+          unawaited(_openFeature(feature));
+        },
+        onRefresh: () {
+          unawaited(_refreshConversations());
+          unawaited(_refreshVoiceStatus());
+          unawaited(_refreshModelInfo());
+        },
+      ),
+      AppSection.computer => ComputerPage(
+        client: _client,
+        connected: !_offline,
+      ),
+    };
+  }
+
+  void _useAttachmentInChat(ChatAttachment attachment) {
+    setState(() {
+      final already = _pendingAttachments.any(
+        (item) => item.id != null && item.id == attachment.id,
+      );
+      if (!already) _pendingAttachments.add(attachment);
+      _section = AppSection.chat;
+    });
+    _composerFocus.requestFocus();
+  }
+
+  Widget _buildChatSection(
+    BuildContext context,
+    bool compact,
+    VoidCallback openHistory,
+  ) {
+    final palette = context.palette;
+    return Listener(
+      onPointerDown: (_) => _noteInteraction(),
+      child: _KeyboardAwareBody(
+        child: Column(
+          children: [
+            _buildChatHeader(context, compact, openHistory),
+            if (_continuousMode) _buildContinuousStatus(),
+            if (_loading)
+              LinearProgressIndicator(
+                minHeight: 2,
+                backgroundColor: palette.border,
+                color: palette.primary,
+              ),
+            if (_offline) _buildOfflineBanner(compact),
+            if (_error != null) _buildErrorBanner(compact),
+            Expanded(child: _buildMessages(compact)),
+            _buildComposer(compact),
+          ],
         ),
       ),
     );
   }
 
+  Widget _buildChatHeader(
+    BuildContext context,
+    bool compact,
+    VoidCallback openHistory,
+  ) {
+    final palette = context.palette;
+    return Container(
+      padding: EdgeInsets.fromLTRB(
+        compact ? 8 : 20,
+        compact ? 6 : 8,
+        compact ? 8 : 14,
+        compact ? 6 : 8,
+      ),
+      color: palette.background,
+      child: Row(
+        children: [
+          if (compact) ...[
+            _HeaderCircleButton(
+              tooltip: 'Histórico de conversas',
+              icon: Icons.menu_rounded,
+              onPressed: openHistory,
+            ),
+            const SizedBox(width: 6),
+          ],
+          Expanded(
+            child: compact
+                ? Center(
+                    child: Text(
+                      _conversationTitle,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        color: palette.text,
+                        fontSize: 15,
+                        fontWeight: FontWeight.w600,
+                        letterSpacing: -0.2,
+                      ),
+                    ),
+                  )
+                : Padding(
+                    padding: const EdgeInsets.only(left: 2),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          _conversationTitle,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            color: palette.text,
+                            fontSize: 15.5,
+                            fontWeight: FontWeight.w600,
+                            letterSpacing: -0.2,
+                          ),
+                        ),
+                        const SizedBox(height: 2),
+                        Row(
+                          children: [
+                            StatusDot(active: !_offline, size: 6),
+                            const SizedBox(width: 5),
+                            Flexible(
+                              child: Text(
+                                _offline
+                                    ? 'Sem conexão'
+                                    : _provider.isEmpty
+                                    ? 'Conectado'
+                                    : _provider,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(
+                                  color: _offline
+                                      ? palette.danger
+                                      : palette.muted,
+                                  fontSize: 10.5,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+          ),
+          ModelSelector(
+            provider: _provider,
+            model: _model,
+            models: _models,
+            loading: _modelsLoading,
+            compact: compact,
+            onSelect: (model) {
+              unawaited(_selectModel(model));
+            },
+            onManage: () {
+              unawaited(_openModelSettings());
+            },
+          ),
+          if (compact) ...[
+            const SizedBox(width: 4),
+            _HeaderCircleButton(
+              tooltip: 'Nova conversa',
+              icon: Icons.add_comment_outlined,
+              onPressed: _newConversation,
+            ),
+          ] else ...[
+            IconButton(
+              tooltip: 'Conversa contínua',
+              onPressed: _showVoicePreferences,
+              color: _continuousMode ? palette.primary : null,
+              icon: Icon(
+                _continuousMode
+                    ? Icons.hearing_rounded
+                    : Icons.hearing_outlined,
+                size: 20,
+              ),
+            ),
+            IconButton(
+              tooltip: _muted
+                  ? 'Ativar respostas faladas'
+                  : 'Silenciar respostas',
+              onPressed: _toggleMuted,
+              color: _muted ? palette.primary : null,
+              icon: Icon(
+                _muted ? Icons.volume_off_rounded : Icons.volume_up_outlined,
+                size: 20,
+              ),
+            ),
+            if (_supportsClockMode)
+              IconButton(
+                tooltip: 'Modo relógio',
+                onPressed: _showClockPreferences,
+                color: _clockModeEnabled ? palette.primary : null,
+                icon: Icon(
+                  _clockModeEnabled
+                      ? Icons.schedule_rounded
+                      : Icons.schedule_outlined,
+                  size: 20,
+                ),
+              ),
+            IconButton(
+              tooltip: 'Tarefas no computador',
+              onPressed: () => _setSection(AppSection.computer),
+              icon: Icon(
+                Icons.terminal_rounded,
+                size: 19,
+                color: palette.muted,
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
   Widget _buildContinuousStatus() {
+    final palette = context.palette;
     final String status;
     if (!_sttAvailable) {
       status = 'Conversa contínua ativa, mas o STT não está configurado.';
@@ -1897,179 +2418,229 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
     }
     return Container(
       width: double.infinity,
-      color: Theme.of(context).colorScheme.secondaryContainer,
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      color: palette.selected,
+      padding: const EdgeInsets.fromLTRB(14, 6, 8, 6),
       child: Row(
         children: [
           Icon(
-            _recording ? Icons.mic : Icons.hearing,
-            size: 18,
-            color: Theme.of(context).colorScheme.onSecondaryContainer,
+            _recording ? Icons.mic_rounded : Icons.hearing_rounded,
+            size: 16,
+            color: palette.primary,
           ),
           const SizedBox(width: 8),
           Expanded(
             child: Text(
               status,
-              style: TextStyle(
-                color: Theme.of(context).colorScheme.onSecondaryContainer,
-              ),
+              style: TextStyle(color: palette.muted, fontSize: 11.5),
             ),
           ),
           IconButton(
             tooltip: 'Desligar conversa contínua',
             visualDensity: VisualDensity.compact,
             onPressed: _disableContinuousMode,
-            icon: const Icon(Icons.close, size: 18),
+            icon: Icon(Icons.close_rounded, size: 17, color: palette.muted),
           ),
         ],
       ),
     );
   }
 
-  Widget _buildDrawer() => Drawer(
-    child: SafeArea(
-      // O menu inteiro rola: em paisagem, a lista fixa de atalhos não cabe
-      // junto com as conversas e estourava o rodapé.
-      child: ListView(
-        padding: EdgeInsets.zero,
-        children: [
-          const Padding(
-            padding: EdgeInsets.fromLTRB(20, 20, 20, 12),
-            child: Text(
-              'Conversas',
-              style: TextStyle(fontSize: 20, fontWeight: FontWeight.w600),
-            ),
-          ),
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 12),
-            child: FilledButton.tonalIcon(
-              onPressed: _newConversation,
-              icon: const Icon(Icons.add),
-              label: const Text('Nova conversa'),
-            ),
-          ),
-          const Divider(height: 24),
-          if (_conversations.isEmpty && _loading)
-            const Padding(
-              padding: EdgeInsets.all(24),
-              child: Center(
-                child: SizedBox.square(
-                  dimension: 22,
-                  child: CircularProgressIndicator(strokeWidth: 2),
+  Widget _buildOfflineBanner(bool compact) {
+    final palette = context.palette;
+    final message = Text(
+      'Sem conexão com o notebook. Mostrando conversas salvas; '
+      'o envio fica indisponível até a conexão voltar.',
+      style: TextStyle(
+        color: palette.danger,
+        fontSize: compact ? 10.5 : 11,
+        height: 1.35,
+      ),
+    );
+    final retry = TextButton(
+      onPressed: () {
+        unawaited(_refreshConversations());
+      },
+      style: TextButton.styleFrom(
+        padding: const EdgeInsets.symmetric(horizontal: 8),
+        minimumSize: const Size(0, 32),
+        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+      ),
+      child: const Text('Tentar de novo', style: TextStyle(fontSize: 11)),
+    );
+    return Container(
+      margin: EdgeInsets.fromLTRB(compact ? 10 : 20, 8, compact ? 10 : 20, 0),
+      padding: EdgeInsets.fromLTRB(12, 8, compact ? 6 : 8, compact ? 4 : 8),
+      decoration: BoxDecoration(
+        color: palette.danger.withValues(alpha: 0.09),
+        borderRadius: BorderRadius.circular(AppRadius.md),
+        border: Border.all(color: palette.danger.withValues(alpha: 0.25)),
+      ),
+      child: compact
+          ? Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Icon(
+                      Icons.cloud_off_outlined,
+                      size: 16,
+                      color: palette.danger,
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(child: message),
+                  ],
                 ),
-              ),
+                Align(alignment: Alignment.centerRight, child: retry),
+              ],
             )
-          else
-            ..._conversations.map((conversation) {
-              final id = conversation['id'] as int;
-              return ListTile(
-                selected: id == _conversationId,
-                leading: const Icon(Icons.chat_bubble_outline),
-                title: Text(
-                  (conversation['title'] as String? ?? 'Conversa').trim(),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                ),
-                trailing: _busyConversations.contains(id)
-                    ? const SizedBox.square(
-                        dimension: 16,
-                        child: CircularProgressIndicator(strokeWidth: 2),
-                      )
-                    : IconButton(
-                        tooltip: 'Apagar conversa',
-                        icon: const Icon(Icons.delete_outline),
-                        onPressed: () => _deleteConversation(id),
-                      ),
-                onTap: () => _openConversation(id),
-              );
-            }),
-          const Divider(height: 12),
-          ListTile(
-            leading: const Icon(Icons.shopping_bag_outlined),
-            title: const Text('Lista de desejos'),
-            onTap: () => _openFeature('wishlist'),
-          ),
-          ListTile(
-            leading: const Icon(Icons.psychology_outlined),
-            title: const Text('Memórias'),
-            onTap: () => _openFeature('memories'),
-          ),
-          ListTile(
-            leading: const Icon(Icons.devices_outlined),
-            title: const Text('Dispositivos'),
-            onTap: () => _openFeature('devices'),
-          ),
-          ListTile(
-            leading: const Icon(Icons.savings_outlined),
-            title: const Text('Meu Dinheiro'),
-            subtitle: const Text('Lançamentos e orçamento'),
-            onTap: () {
-              Navigator.pop(context);
-              unawaited(_openFinance());
-            },
-          ),
-          ListTile(
-            leading: const Icon(Icons.tune_outlined),
-            title: const Text('Modelo e voz'),
-            onTap: () => _openFeature('settings'),
-          ),
-          if (Platform.isAndroid || Platform.isIOS)
-            ListTile(
-              leading: const Icon(Icons.qr_code_scanner),
-              title: const Text('Parear com QR code'),
-              subtitle: const Text('Conectar sem copiar token'),
-              onTap: () {
-                Navigator.pop(context);
-                unawaited(_openQrPairing());
-              },
+          : Row(
+              children: [
+                Icon(Icons.cloud_off_outlined, size: 17, color: palette.danger),
+                const SizedBox(width: 8),
+                Expanded(child: message),
+                retry,
+              ],
             ),
-          if (Platform.isAndroid)
-            ListTile(
-              leading: Icon(
-                _isAssistant ? Icons.assistant : Icons.assistant_outlined,
-              ),
-              title: const Text('Assistente do celular'),
-              subtitle: Text(
-                _isAssistant
-                    ? 'Assistente padrão · notificações e apps'
-                    : 'Definir assistente, notificações e apps',
-              ),
-              onTap: () {
-                Navigator.pop(context);
-                unawaited(_openPhoneAssistant());
-              },
-            ),
-          ListTile(
-            leading: const Icon(Icons.brightness_6_outlined),
-            title: const Text('Tema'),
-            subtitle: Text(themeController.label),
-            onTap: () {
-              Navigator.pop(context);
-              unawaited(_showThemePicker());
-            },
-          ),
-          if (_supportsClockMode)
-            ListTile(
-              leading: const Icon(Icons.schedule_outlined),
-              title: const Text('Modo relógio'),
-              onTap: () {
-                Navigator.pop(context);
-                unawaited(_showClockPreferences());
-              },
-            ),
-          Padding(
-            padding: const EdgeInsets.all(16),
+    );
+  }
+
+  Widget _buildErrorBanner(bool compact) {
+    final palette = context.palette;
+    return Container(
+      margin: EdgeInsets.fromLTRB(compact ? 10 : 20, 8, compact ? 10 : 20, 0),
+      padding: const EdgeInsets.fromLTRB(12, 8, 6, 8),
+      decoration: BoxDecoration(
+        color: palette.card,
+        borderRadius: BorderRadius.circular(AppRadius.md),
+        border: Border.all(color: palette.border),
+      ),
+      child: Row(
+        children: [
+          Icon(Icons.info_outline_rounded, size: 17, color: palette.muted),
+          const SizedBox(width: 8),
+          Expanded(
             child: Text(
-              _backendUrl,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: Theme.of(context).textTheme.bodySmall,
+              _error!,
+              style: TextStyle(
+                color: palette.muted,
+                fontSize: 11,
+                height: 1.35,
+              ),
             ),
+          ),
+          IconButton(
+            tooltip: 'Fechar aviso',
+            visualDensity: VisualDensity.compact,
+            onPressed: () => setState(() => _error = null),
+            icon: Icon(Icons.close_rounded, size: 16, color: palette.muted),
           ),
         ],
       ),
-    ),
-  );
+    );
+  }
+
+  Widget _buildMessages(bool compact) {
+    if (_messages.isEmpty) {
+      return EmptyChatView(
+        greeting: _greeting,
+        memoryCount: _memoryCount,
+        compact: compact,
+        onSuggestion: (prompt) {
+          _input.text = prompt;
+          _input.selection = TextSelection.collapsed(offset: prompt.length);
+          _composerFocus.requestFocus();
+        },
+      );
+    }
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final horizontal = constraints.maxWidth >= 1000
+            ? (constraints.maxWidth - 960) / 2
+            : compact
+            ? 12.0
+            : 24.0;
+        return ListView.builder(
+          controller: _scroll,
+          padding: EdgeInsets.fromLTRB(
+            horizontal,
+            compact ? 14 : 22,
+            horizontal,
+            10,
+          ),
+          keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
+          itemCount: _messages.length,
+          itemBuilder: (context, index) {
+            final message = _messages[index];
+            final streaming = _isStreamingIndex(index);
+            final display = message.isUser || streaming
+                ? message
+                : ChatMessage(
+                    role: message.role,
+                    content: _cleanForDisplay(message.content),
+                    sources: message.sources,
+                    attachments: message.attachments,
+                    createdAt: message.createdAt,
+                  );
+            return ChatMessageBubble(
+              message: display,
+              isStreaming: streaming,
+              onSpeak: _ttsAvailable
+                  ? () => _speakText(_cleanForDisplay(message.content))
+                  : null,
+              onOpenSource: _openSource,
+              loadAttachment: _loadAttachmentBytes,
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Widget _buildComposer(bool compact) {
+    return Padding(
+      padding: EdgeInsets.fromLTRB(
+        compact ? 10 : 20,
+        6,
+        compact ? 10 : 20,
+        compact ? 10 : 14,
+      ),
+      child: Center(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 1000),
+          child: MessageComposer(
+            controller: _input,
+            focusNode: _composerFocus,
+            attachments: _pendingAttachments,
+            busy: _busy,
+            offline: _offline,
+            recording: _recording,
+            speaking: _speaking,
+            uploading: _uploadingAttachment,
+            compact: compact,
+            onSend: () {
+              unawaited(_send());
+            },
+            onVoice: () {
+              unawaited(_toggleVoice());
+            },
+            onPickFile: () {
+              unawaited(_pickAttachment(imagesOnly: false));
+            },
+            onPickImage: () {
+              unawaited(_pickAttachment(imagesOnly: true));
+            },
+            onRemoveAttachment: _removePendingAttachment,
+            onOpenComputer: () => _setSection(AppSection.computer),
+            onInsertLink: () {
+              unawaited(_insertLink());
+            },
+            loadAttachment: _loadAttachmentBytes,
+          ),
+        ),
+      ),
+    );
+  }
 
   Future<void> _openFinance() async {
     final base = _backendUrl.endsWith('/')
@@ -2135,7 +2706,6 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
   }
 
   Future<void> _openFeature(String feature) async {
-    Navigator.pop(context);
     await Navigator.push<void>(
       context,
       MaterialPageRoute(
@@ -2149,154 +2719,35 @@ class _ChatPageState extends State<ChatPage> with WidgetsBindingObserver {
       await _refreshVoiceStatus();
     }
   }
-
-  Widget _buildMessages() {
-    if (_messages.isEmpty) {
-      // Em telas deitadas, com o teclado aberto, a saudação não cabe. O
-      // scroll mantém o conteúdo acessível em vez de estourar o layout.
-      return LayoutBuilder(
-        builder: (context, constraints) => SingleChildScrollView(
-          padding: const EdgeInsets.all(32),
-          child: ConstrainedBox(
-            constraints: BoxConstraints(
-              minHeight: math.max(0, constraints.maxHeight - 64),
-            ),
-            child: Center(
-              child: ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 520),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(
-                      Icons.forum_outlined,
-                      size: 42,
-                      color: Theme.of(context).colorScheme.primary,
-                    ),
-                    const SizedBox(height: 12),
-                    Text(
-                      _greeting,
-                      textAlign: TextAlign.center,
-                      style: Theme.of(context).textTheme.headlineSmall,
-                    ),
-                    const SizedBox(height: 8),
-                    Text(
-                      _memoryCount > 0
-                          ? 'Baseado em $_memoryCount memória(s) sua(s).'
-                          : 'As conversas e respostas ficam no seu backend local.',
-                      textAlign: TextAlign.center,
-                      style: Theme.of(context).textTheme.bodySmall,
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          ),
-        ),
-      );
-    }
-    return ListView.builder(
-      controller: _scroll,
-      padding: const EdgeInsets.fromLTRB(16, 20, 16, 16),
-      itemCount: _messages.length,
-      keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
-      itemBuilder: (context, index) => _MessageBubble(
-        message: _messages[index],
-        isStreaming: _isStreamingIndex(index),
-        onSpeak: _ttsAvailable
-            ? () => _speakText(_cleanForDisplay(_messages[index].content))
-            : null,
-        onOpenSource: _openSource,
-      ),
-    );
-  }
-
-  Widget _buildComposer() {
-    return _ComposerPadding(
-      child: Center(
-        child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 900),
-          child: Row(
-            crossAxisAlignment: CrossAxisAlignment.end,
-            children: [
-              Expanded(
-                child: TextField(
-                  controller: _input,
-                  minLines: 1,
-                  maxLines: 6,
-                  enabled: !_busy && !_offline,
-                  textCapitalization: TextCapitalization.sentences,
-                  decoration: InputDecoration(
-                    hintText: 'Escreva uma mensagem',
-                    filled: true,
-                    fillColor: Theme.of(context)
-                        .colorScheme
-                        .surfaceContainerHighest,
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(24),
-                      borderSide: BorderSide.none,
-                    ),
-                    contentPadding: const EdgeInsets.symmetric(
-                      horizontal: 18,
-                      vertical: 13,
-                    ),
-                  ),
-                  onSubmitted: (_) => _send(),
-                  onChanged: (_) => _noteInteraction(),
-                ),
-              ),
-              const SizedBox(width: 8),
-              IconButton(
-                tooltip: _recording
-                    ? 'Parar gravação'
-                    : _speaking
-                    ? 'Interromper fala e gravar'
-                    : 'Falar',
-                onPressed: (_busy && !_speaking) ? null : _toggleVoice,
-                color: _recording ? Theme.of(context).colorScheme.error : null,
-                icon: Icon(
-                  _recording || _speaking
-                      ? Icons.stop_circle_outlined
-                      : Icons.mic_none,
-                ),
-              ),
-              const SizedBox(width: 4),
-              IconButton.filled(
-                tooltip: 'Enviar',
-                onPressed: _busy || _offline ? null : _send,
-                icon: _busy
-                    ? const SizedBox.square(
-                        dimension: 18,
-                        child: CircularProgressIndicator(strokeWidth: 2),
-                      )
-                    : const Icon(Icons.arrow_upward),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
 }
 
-class _ComposerPadding extends StatelessWidget {
-  const _ComposerPadding({required this.child});
+class _HeaderCircleButton extends StatelessWidget {
+  const _HeaderCircleButton({
+    required this.tooltip,
+    required this.icon,
+    required this.onPressed,
+  });
 
-  final Widget child;
+  final String tooltip;
+  final IconData icon;
+  final VoidCallback onPressed;
 
   @override
   Widget build(BuildContext context) {
-    // O padding do compositor acompanha o teclado, mas o filho (TextField e
-    // botões) é a mesma instância: o teclado não reconstrói o campo.
-    final keyboardOpen = MediaQuery.viewInsetsOf(context).bottom > 0;
-    final bottomPadding = keyboardOpen
-        ? 8.0
-        : 14.0 + MediaQuery.paddingOf(context).bottom;
-    return SafeArea(
-      top: false,
-      bottom: false,
-      child: Padding(
-        padding: EdgeInsets.fromLTRB(16, 8, 16, bottomPadding),
-        child: child,
+    final palette = context.palette;
+    return Tooltip(
+      message: tooltip,
+      child: IconButton(
+        onPressed: onPressed,
+        style: IconButton.styleFrom(
+          backgroundColor: palette.input,
+          foregroundColor: palette.text,
+          minimumSize: const Size(40, 40),
+          fixedSize: const Size(40, 40),
+          padding: EdgeInsets.zero,
+          shape: const CircleBorder(),
+        ),
+        icon: Icon(icon, size: 20),
       ),
     );
   }
@@ -2617,7 +3068,8 @@ class _ConnectionSettingsDialogState extends State<_ConnectionSettingsDialog> {
   void initState() {
     super.initState();
     _urlController = TextEditingController(text: widget.backendUrl);
-    _tokenController = TextEditingController(text: widget.backendToken ?? '');
+    // O token nunca é exibido. Em branco, o valor já salvo é preservado.
+    _tokenController = TextEditingController();
   }
 
   @override
@@ -2650,9 +3102,14 @@ class _ConnectionSettingsDialogState extends State<_ConnectionSettingsDialog> {
           TextField(
             controller: _tokenController,
             obscureText: true,
-            decoration: const InputDecoration(
-              labelText: 'Token da API (opcional)',
-              helperText: 'Armazenado no cofre de senhas do sistema.',
+            decoration: InputDecoration(
+              labelText: 'Novo token da API (opcional)',
+              helperText: (widget.backendToken ?? '').isEmpty
+                  ? 'Informe o token configurado no backend. '
+                        'O valor fica no cofre de senhas do sistema.'
+                  : 'Deixe em branco para manter o token atual. '
+                        'O valor fica no cofre de senhas do sistema.',
+              helperMaxLines: 2,
             ),
           ),
         ],
@@ -2703,78 +3160,6 @@ class _PairingPayload {
   }
 }
 
-class _ChatRun {
-  _ChatRun({required this.messages, required this.assistantIndex});
-
-  final List<_ChatMessage> messages;
-  final int assistantIndex;
-  int? conversationId;
-}
-
-class _Source {
-  const _Source({required this.title, required this.url, this.snippet = ''});
-
-  final String title;
-  final String url;
-  final String snippet;
-
-  factory _Source.fromJson(Map<String, dynamic> json) => _Source(
-    title: (json['title'] as String? ?? '').trim(),
-    url: (json['url'] as String? ?? '').trim(),
-    snippet: (json['snippet'] as String? ?? '').trim(),
-  );
-
-  Map<String, dynamic> toJson() => {
-    'title': title,
-    'url': url,
-    if (snippet.isNotEmpty) 'snippet': snippet,
-  };
-}
-
-List<_Source> _parseSources(dynamic raw) {
-  if (raw is! List) return const [];
-  return raw
-      .whereType<Map>()
-      .map((item) => _Source.fromJson(Map<String, dynamic>.from(item)))
-      .where((source) => source.url.isNotEmpty || source.title.isNotEmpty)
-      .toList();
-}
-
-class _ChatMessage {
-  const _ChatMessage({
-    required this.role,
-    required this.content,
-    this.sources = const [],
-  });
-
-  final String role;
-  final String content;
-  final List<_Source> sources;
-
-  factory _ChatMessage.fromJson(Map<String, dynamic> json) {
-    var sources = _parseSources(json['sources']);
-    if (sources.isEmpty && json['sources_json'] is String) {
-      try {
-        sources = _parseSources(jsonDecode(json['sources_json'] as String));
-      } catch (_) {
-        sources = const [];
-      }
-    }
-    return _ChatMessage(
-      role: json['role'] as String? ?? 'assistant',
-      content: json['content'] as String? ?? '',
-      sources: sources,
-    );
-  }
-
-  Map<String, dynamic> toJson() => {
-    'role': role,
-    'content': content,
-    if (sources.isNotEmpty)
-      'sources': sources.map((item) => item.toJson()).toList(),
-  };
-}
-
 String _cleanForDisplay(String text) {
   var value = text.replaceAllMapped(
     RegExp(r'\[([^\]]+)\]\((?:https?://|www\.)[^)]+\)', caseSensitive: false),
@@ -2799,269 +3184,12 @@ String _cleanForDisplay(String text) {
   return value.trim();
 }
 
-class _MarkdownText extends StatelessWidget {
-  const _MarkdownText(this.text);
+class _ChatRun {
+  _ChatRun({required this.messages, required this.assistantIndex});
 
-  final String text;
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final base = (theme.textTheme.bodyMedium ?? const TextStyle()).copyWith(
-      height: 1.42,
-    );
-    final spans = <InlineSpan>[];
-    for (final line in text.split('\n')) {
-      final trimmed = line.trimRight();
-      if (trimmed.trim().isEmpty) {
-        spans.add(const TextSpan(text: '\n'));
-        continue;
-      }
-      final heading = RegExp(r'^(#{1,3})\s+(.*)$').firstMatch(trimmed);
-      if (heading != null) {
-        final level = heading[1]!.length;
-        final factor = switch (level) {
-          1 => 1.35,
-          2 => 1.2,
-          _ => 1.1,
-        };
-        spans.add(
-          TextSpan(
-            text: '${_plainInline(heading[2]!)}\n',
-            style: base.copyWith(
-              fontSize: (base.fontSize ?? 14) * factor,
-              fontWeight: FontWeight.w700,
-            ),
-          ),
-        );
-        continue;
-      }
-      final bullet = RegExp(r'^\s*[-*•]\s+(.*)$').firstMatch(trimmed);
-      if (bullet != null) {
-        spans.add(const TextSpan(text: '•  '));
-        spans.addAll(_inlineSpans(bullet[1]!, base));
-        spans.add(const TextSpan(text: '\n'));
-        continue;
-      }
-      final numbered = RegExp(r'^\s*(\d+[.)])\s+(.*)$').firstMatch(trimmed);
-      if (numbered != null) {
-        spans.add(TextSpan(text: '${numbered[1]}  '));
-        spans.addAll(_inlineSpans(numbered[2]!, base));
-        spans.add(const TextSpan(text: '\n'));
-        continue;
-      }
-      spans.addAll(_inlineSpans(trimmed, base));
-      spans.add(const TextSpan(text: '\n'));
-    }
-    if (spans.isNotEmpty &&
-        spans.last is TextSpan &&
-        (spans.last as TextSpan).text == '\n') {
-      spans.removeLast();
-    }
-    return SelectableText.rich(TextSpan(children: spans, style: base));
-  }
-}
-
-String _plainInline(String value) => value
-    .replaceAll('**', '')
-    .replaceAll('__', '')
-    .replaceAll('`', '')
-    .replaceAll('*', '')
-    .replaceAll('_', '');
-
-List<InlineSpan> _inlineSpans(String text, TextStyle base) {
-  final spans = <InlineSpan>[];
-  final pattern = RegExp(
-    r'(\*\*[^*]+\*\*|__[^_]+__|\*[^*\n]+\*|_[^_\n]+_|`[^`]+`)',
-  );
-  var index = 0;
-  for (final match in pattern.allMatches(text)) {
-    if (match.start > index) {
-      spans.add(TextSpan(text: text.substring(index, match.start)));
-    }
-    final token = match.group(0)!;
-    if (token.startsWith('**') || token.startsWith('__')) {
-      spans.add(
-        TextSpan(
-          text: token.substring(2, token.length - 2),
-          style: const TextStyle(fontWeight: FontWeight.w700),
-        ),
-      );
-    } else if (token.startsWith('`')) {
-      spans.add(
-        TextSpan(
-          text: token.substring(1, token.length - 1),
-          style: TextStyle(
-            fontFamily: 'monospace',
-            backgroundColor: base.color?.withValues(alpha: 0.10),
-          ),
-        ),
-      );
-    } else {
-      spans.add(
-        TextSpan(
-          text: token.substring(1, token.length - 1),
-          style: const TextStyle(fontStyle: FontStyle.italic),
-        ),
-      );
-    }
-    index = match.end;
-  }
-  if (index < text.length) {
-    spans.add(TextSpan(text: text.substring(index)));
-  }
-  return spans;
-}
-
-class _MessageBubble extends StatelessWidget {
-  const _MessageBubble({
-    required this.message,
-    this.isStreaming = false,
-    this.onSpeak,
-    this.onOpenSource,
-  });
-
-  final _ChatMessage message;
-  final bool isStreaming;
-  final VoidCallback? onSpeak;
-  final ValueChanged<String>? onOpenSource;
-
-  @override
-  Widget build(BuildContext context) {
-    final isUser = message.role == 'user';
-    final colors = Theme.of(context).colorScheme;
-    // Durante o streaming, texto puro evita reprocessar Markdown e recriar
-    // SelectableText a cada token. A formatação entra só quando a resposta
-    // termina.
-    final cleaned = isUser || isStreaming
-        ? message.content
-        : _cleanForDisplay(message.content);
-    final body = !isUser && cleaned.isEmpty && message.sources.isNotEmpty
-        ? 'Consulte as fontes abaixo.'
-        : cleaned;
-    final showProgress = message.content.isEmpty && message.sources.isEmpty;
-    return Align(
-      alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
-      child: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 760),
-        child: Container(
-          margin: const EdgeInsets.only(bottom: 12),
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-          decoration: BoxDecoration(
-            color: isUser
-                ? colors.primaryContainer
-                : colors.surfaceContainerHigh,
-            borderRadius: BorderRadius.circular(20),
-          ),
-          child: showProgress
-              ? const SizedBox(
-                  width: 28,
-                  height: 18,
-                  child: LinearProgressIndicator(minHeight: 3),
-                )
-              : Column(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      mainAxisSize: MainAxisSize.min,
-                      crossAxisAlignment: CrossAxisAlignment.center,
-                      children: [
-                        Flexible(
-                          child: isStreaming
-                              ? Text(body)
-                              : isUser
-                              ? SelectableText(body)
-                              : _MarkdownText(body),
-                        ),
-                        if (!isUser && !isStreaming && onSpeak != null)
-                          IconButton(
-                            tooltip: 'Ouvir resposta',
-                            onPressed: onSpeak,
-                            icon: const Icon(Icons.volume_up_outlined),
-                          ),
-                      ],
-                    ),
-                    if (!isUser && message.sources.isNotEmpty)
-                      _SourcesButton(
-                        sources: message.sources,
-                        onOpen: onOpenSource,
-                      ),
-                  ],
-                ),
-        ),
-      ),
-    );
-  }
-}
-
-class _SourcesButton extends StatelessWidget {
-  const _SourcesButton({required this.sources, this.onOpen});
-
-  final List<_Source> sources;
-  final ValueChanged<String>? onOpen;
-
-  @override
-  Widget build(BuildContext context) {
-    final colors = Theme.of(context).colorScheme;
-    return Align(
-      alignment: Alignment.centerLeft,
-      child: TextButton.icon(
-        onPressed: () => showModalBottomSheet<void>(
-          context: context,
-          showDragHandle: true,
-          builder: (sheetContext) => SafeArea(
-            child: ListView(
-              shrinkWrap: true,
-              children: [
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(20, 4, 20, 8),
-                  child: Text(
-                    'Fontes usadas',
-                    style: Theme.of(sheetContext).textTheme.titleMedium,
-                  ),
-                ),
-                for (final source in sources)
-                  ListTile(
-                    leading: const Icon(Icons.link, size: 20),
-                    title: Text(
-                      source.title.isEmpty ? source.url : source.title,
-                      maxLines: 2,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                    subtitle: Text(
-                      source.snippet.isEmpty ? source.url : source.snippet,
-                      maxLines: 2,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                    trailing: source.url.isEmpty
-                        ? null
-                        : const Icon(Icons.open_in_new, size: 18),
-                    onTap: source.url.isEmpty
-                        ? null
-                        : () {
-                            Navigator.pop(sheetContext);
-                            onOpen?.call(source.url);
-                          },
-                  ),
-              ],
-            ),
-          ),
-        ),
-        style: TextButton.styleFrom(
-          foregroundColor: colors.onSurfaceVariant.withValues(alpha: 0.68),
-          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-          // Discreto no visual, mas com área tocável de verdade: antes o
-          // alvo tinha ~20 px e o toque caía no texto selecionável da bolha.
-          minimumSize: const Size(0, 40),
-          tapTargetSize: MaterialTapTargetSize.padded,
-          textStyle: const TextStyle(fontSize: 11),
-        ),
-        icon: const Icon(Icons.link, size: 13),
-        label: Text('Fontes · ${sources.length}'),
-      ),
-    );
-  }
+  final List<ChatMessage> messages;
+  final int assistantIndex;
+  int? conversationId;
 }
 
 class _KeyboardAwareBody extends StatelessWidget {
@@ -3079,20 +3207,6 @@ class _KeyboardAwareBody extends StatelessWidget {
       child: child,
     );
   }
-}
-
-class _ErrorBanner extends StatelessWidget {
-  const _ErrorBanner({required this.message, required this.onDismiss});
-
-  final String message;
-  final VoidCallback onDismiss;
-
-  @override
-  Widget build(BuildContext context) => MaterialBanner(
-    content: Text(message),
-    leading: const Icon(Icons.wifi_off_outlined),
-    actions: [TextButton(onPressed: onDismiss, child: const Text('Fechar'))],
-  );
 }
 
 class _CollectionPage extends StatefulWidget {
@@ -3628,7 +3742,7 @@ class _ModelSettingsPage extends StatefulWidget {
 class _ModelSettingsPageState extends State<_ModelSettingsPage> {
   final _model = TextEditingController();
   List<String> _providers = [];
-  String _provider = 'fake';
+  String _provider = 'ollama';
   Map<String, dynamic>? _configuration;
   String? _error;
   bool _loading = true;

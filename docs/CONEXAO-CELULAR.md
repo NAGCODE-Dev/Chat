@@ -128,17 +128,40 @@ segundo plano. Veja [`MEU-DINHEIRO.md`](MEU-DINHEIRO.md).
 
 ## Acesso fora de casa com Tailscale
 
-O notebook já tem Tailscale ativo (IP `100.97.209.46`). Para o celular acessar
-fora de casa:
+O notebook e o celular já têm Tailscale ativo. Para acessar fora de casa:
 
-1. Instale o Tailscale no celular (Play Store) e entre na mesma conta.
-2. Confirme que os dois aparelhos aparecem em `tailscale status`.
-3. Gere um novo QR; ele incluirá a URL `http://100.97.209.46:8750`.
-4. Se o IP Tailscale mudar, gere outro QR ou ajuste a URL em
+1. Confirme que os dois aparelhos aparecem em `tailscale status`.
+2. Gere um novo QR; ele incluirá a URL `http://100.97.209.46:8750`.
+3. Se o IP Tailscale mudar, gere outro QR ou ajuste a URL em
    **Configurar conexão**.
 
 Não é preciso abrir porta no roteador nem expor o backend à internet. O
 Tailscale cria uma rede privada WireGuard entre os aparelhos.
+
+No Android, deixe o Tailscale como **VPN sempre ativa** e fora da otimização de
+bateria (Configurações > Rede e internet > VPN > Tailscale > Sempre ativa;
+Bateria > Tailscale > Sem restrições). Assim ele volta sozinho depois de
+reiniciar o celular ou de o Android encerrar o app em segundo plano.
+
+Em casa, o IP da rede local (`ip -4 addr`, normalmente `192.168.x.x`) tem menos
+latência. Para funcionar em qualquer lugar sem trocar configuração, use a URL
+Tailscale (`http://100.x.y.z:8750`). Se a URL salva for a de USB e o cabo for
+removido, o app fica offline; para uso diário, prefira a URL Tailscale. Se o
+backend não responder, o cliente desiste em 8 segundos e mostra o estado
+offline em vez de travar a navegação.
+
+## Desempenho
+
+- Instale o APK `--release`, não o `--debug`. O modo debug usa JIT e deixa a
+  animação do teclado e a navegação visivelmente lentas.
+- O primeiro turno depois de abrir o app aquece o modelo. O backend pré-carrega
+  o modelo rápido e o padrão e guarda o cache do prompt do sistema; ainda
+  assim, a primeira resposta pode levar alguns segundos.
+- Respostas curtas usam o modelo rápido. Perguntas de finanças, cotação e
+  notícias são respondidas direto do SQLite/RSS, sem modelo.
+- Se o notebook estiver com pouca memória livre, feche outros apps ou reduza
+  `CHAT_NUM_CTX`/`CHAT_MAX_TOKENS` em `~/.config/chat/backend.env` e reinicie
+  `chat-backend.service`.
 
 ## Onde hospedar
 
@@ -155,12 +178,11 @@ notebook ligado e o serviço `chat-backend.service` ativo.
 
 ## Limitações
 
-- O Tailscale ainda não está instalado no celular; o acesso fora de casa fica
-  pendente até instalar o app e entrar na mesma conta.
 - O endereço Wi-Fi/Tailscale pode mudar; se o app parar de conectar, confira o
   IP do PC e gere um QR novo.
 - USB tethering mantém o cabo e consome bateria; o Wi-Fi é o modo normal.
 - Não há escuta contínua em segundo plano; a conversa contínua funciona com o
   app aberto.
 - A integração com apps de finanças ainda depende de identificar o app usado.
-- O APK atual é `debug`; para uso diário, gere um `release` assinado.
+- O APK de uso diário é o `release`; o `debug` serve apenas para
+  desenvolvimento e é bem mais lento.

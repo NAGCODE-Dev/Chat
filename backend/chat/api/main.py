@@ -19,6 +19,7 @@ from starlette.responses import Response
 from chat.agent_orchestration.chat_service import ChatService
 from chat.api.body_limit import RequestBodyLimitMiddleware
 from chat.api.rate_limit import rate_limiter
+from chat.api.routes_attachments import router as attachments_router
 from chat.api.routes_chat import router as chat_router
 from chat.api.routes_devices import router as devices_router
 from chat.api.routes_finance import router as finance_router
@@ -31,6 +32,7 @@ from chat.api.routes_pairing import (
     router as pairing_router,
 )
 from chat.api.routes_settings import router as settings_router
+from chat.api.routes_ubuntu import router as ubuntu_router
 from chat.api.routes_voice import router as voice_router
 from chat.api.routes_wishlist import router as wishlist_router
 from chat.api.state import state
@@ -215,6 +217,7 @@ async def require_api_token(request: Request, call_next) -> Response:
             return JSONResponse(status_code=401, content={"detail": "Token inválido."})
     return await call_next(request)
 app.include_router(chat_router)
+app.include_router(attachments_router)
 app.include_router(memory_router)
 app.include_router(pairing_router)
 app.include_router(models_router)
@@ -222,6 +225,7 @@ app.include_router(voice_router)
 app.include_router(devices_router)
 app.include_router(wishlist_router)
 app.include_router(settings_router)
+app.include_router(ubuntu_router)
 app.include_router(finance_router)
 app.mount(
     "/finance",
@@ -243,8 +247,14 @@ async def health() -> dict:
         "model": state.settings.model if state.settings else None,
         "model_auto": state.settings.model_auto if state.settings else None,
         "model_large": state.settings.model_large if state.settings else None,
+        "vision_model": state.settings.vision_model if state.settings else None,
         "provider_healthy": provider_ok,
-        "providers_available": available_providers(),
+        "providers_available": [
+            name
+            for name in available_providers()
+            if name != "fake"
+            or (state.settings is not None and state.settings.provider == "fake")
+        ],
         "voice": {
             "stt_available": state.stt_engine is not None,
             "tts_available": state.tts_engine is not None,

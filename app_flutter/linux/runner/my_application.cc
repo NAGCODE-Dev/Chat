@@ -10,9 +10,37 @@
 struct _MyApplication {
   GtkApplication parent_instance;
   char** dart_entrypoint_arguments;
+  FlMethodChannel* window_channel;
 };
 
 G_DEFINE_TYPE(MyApplication, my_application, GTK_TYPE_APPLICATION)
+
+// Controla a janela a pedido do Dart (usado pelo modo relógio).
+static void window_method_call_cb(FlMethodChannel* channel,
+                                  FlMethodCall* method_call,
+                                  gpointer user_data) {
+  GtkWindow* window = GTK_WINDOW(user_data);
+  const gchar* method = fl_method_call_get_name(method_call);
+
+  if (g_strcmp0(method, "setFullscreen") == 0) {
+    g_autoptr(FlValue) args = fl_method_call_get_args(method_call);
+    gboolean fullscreen = FALSE;
+    if (args != nullptr && fl_value_get_type(args) == FL_VALUE_TYPE_BOOL) {
+      fullscreen = fl_value_get_bool(args);
+    }
+    if (fullscreen) {
+      gtk_window_fullscreen(window);
+    } else {
+      gtk_window_unfullscreen(window);
+    }
+    g_autoptr(FlMethodResponse) response =
+        FL_METHOD_RESPONSE(fl_method_success_response_new(nullptr));
+    fl_method_call_respond(method_call, response, nullptr);
+    return;
+  }
+
+  fl_method_call_respond_not_implemented(method_call, nullptr);
+}
 
 // Called when first Flutter frame received.
 static void first_frame_cb(MyApplication* self, FlView* view) {
@@ -45,11 +73,11 @@ static void my_application_activate(GApplication* application) {
   if (use_header_bar) {
     GtkHeaderBar* header_bar = GTK_HEADER_BAR(gtk_header_bar_new());
     gtk_widget_show(GTK_WIDGET(header_bar));
-    gtk_header_bar_set_title(header_bar, "chat_app");
+    gtk_header_bar_set_title(header_bar, "Chat");
     gtk_header_bar_set_show_close_button(header_bar, TRUE);
     gtk_window_set_titlebar(window, GTK_WIDGET(header_bar));
   } else {
-    gtk_window_set_title(window, "chat_app");
+    gtk_window_set_title(window, "Chat");
   }
 
   gtk_window_set_default_size(window, 1280, 720);
@@ -72,6 +100,15 @@ static void my_application_activate(GApplication* application) {
   g_signal_connect_swapped(view, "first-frame", G_CALLBACK(first_frame_cb),
                            self);
   gtk_widget_realize(GTK_WIDGET(view));
+
+  // Canal estável para tela cheia; o Flutter não tem API de janela no Linux.
+  FlEngine* engine = fl_view_get_engine(view);
+  g_autoptr(FlStandardMethodCodec) codec = fl_standard_method_codec_new();
+  self->window_channel = fl_method_channel_new(
+      fl_engine_get_binary_messenger(engine), "chat/window",
+      FL_METHOD_CODEC(codec));
+  fl_method_channel_set_method_call_handler(
+      self->window_channel, window_method_call_cb, window, nullptr);
 
   fl_register_plugins(FL_PLUGIN_REGISTRY(view));
 
@@ -120,6 +157,7 @@ static void my_application_shutdown(GApplication* application) {
 // Implements GObject::dispose.
 static void my_application_dispose(GObject* object) {
   MyApplication* self = MY_APPLICATION(object);
+  g_clear_object(&self->window_channel);
   g_clear_pointer(&self->dart_entrypoint_arguments, g_strfreev);
   G_OBJECT_CLASS(my_application_parent_class)->dispose(object);
 }

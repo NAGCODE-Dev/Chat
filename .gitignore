@@ -21,7 +21,11 @@ app_flutter/build/
 app_flutter/.flutter-plugins-dependencies
 app_flutter/linux/flutter/ephemeral/
 app_flutter/android/.gradle/
+app_flutter/android/.kotlin/
 app_flutter/android/local.properties
+
+# Pacotes gerados
+dist/
 
 # Editores e sistema
 .idea/

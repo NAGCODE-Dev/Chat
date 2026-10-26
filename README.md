@@ -53,6 +53,10 @@ scripts/dev_run.sh
 cd app_flutter
 flutter build linux
 ./build/linux/x64/release/bundle/chat_app
+
+# pacote Linux instalável (.deb)
+scripts/package_deb.sh
+sudo dpkg -i dist/chat-app_1.0.0_amd64.deb
 ```
 
 Detalhes de configuração, token, voz e agente em

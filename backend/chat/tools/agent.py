@@ -54,10 +54,12 @@ class AgentArgs(ToolArguments):
         "write_file",
         "append_file",
         "create_dir",
+        "opencode",
     ]
     app: Literal["browser", "files", "terminal", "editor"] | None = None
     path: str | None = Field(default=None, min_length=1, max_length=1024)
     content: str | None = Field(default=None, max_length=32 * 1024)
+    prompt: str | None = Field(default=None, min_length=1, max_length=8000)
 
     @field_validator("app", "path")
     @classmethod
@@ -69,30 +71,35 @@ class AgentArgs(ToolArguments):
         if self.action == "open_app":
             if self.app is None:
                 raise ValueError("Informe o aplicativo permitido.")
-            if self.path is not None or self.content is not None:
+            if self.path is not None or self.content is not None or self.prompt is not None:
                 raise ValueError("Abrir aplicativo não aceita caminho nem conteúdo.")
         elif self.action in {"list_files", "read_file"}:
             if self.path is None:
                 raise ValueError("Informe o caminho absoluto.")
-            if self.app is not None or self.content is not None:
+            if self.app is not None or self.content is not None or self.prompt is not None:
                 raise ValueError("Leitura de arquivos não aceita aplicativo nem conteúdo.")
             if not self.path.startswith("/"):
                 raise ValueError("O caminho precisa ser absoluto.")
         elif self.action in {"write_file", "append_file"}:
             if self.path is None or self.content is None:
                 raise ValueError("Informe o caminho absoluto e o conteúdo.")
-            if self.app is not None:
+            if self.app is not None or self.prompt is not None:
                 raise ValueError("Escrita de arquivos não aceita aplicativo.")
             if not self.path.startswith("/"):
                 raise ValueError("O caminho precisa ser absoluto.")
         elif self.action == "create_dir":
             if self.path is None:
                 raise ValueError("Informe o caminho absoluto da pasta.")
-            if self.app is not None or self.content is not None:
+            if self.app is not None or self.content is not None or self.prompt is not None:
                 raise ValueError("Criação de pasta não aceita aplicativo nem conteúdo.")
             if not self.path.startswith("/"):
                 raise ValueError("O caminho precisa ser absoluto.")
-        elif self.app is not None or self.path is not None or self.content is not None:
+        elif self.action == "opencode":
+            if self.prompt is None:
+                raise ValueError("Informe a tarefa para o OpenCode.")
+            if self.app is not None or self.path is not None or self.content is not None:
+                raise ValueError("Tarefa do OpenCode aceita somente o texto da tarefa.")
+        elif self.app is not None or self.path is not None or self.content is not None or self.prompt is not None:
             raise ValueError("Consulta de estado não aceita parâmetros.")
         return self
 
@@ -101,8 +108,9 @@ class AgentExec(Tool):
     name = "agent_exec"
     description = (
         "Auxilia em tarefas do dia a dia no notebook: consulta o estado, abre um "
-        "aplicativo permitido, lista ou lê arquivos e salva anotações e documentos "
-        "em texto dentro das pastas autorizadas."
+        "aplicativo permitido, lista ou lê arquivos, salva anotações e documentos "
+        "em texto dentro das pastas autorizadas e, quando a pessoa pedir uma tarefa "
+        "de programação ou automação, executa o OpenCode na pasta de trabalho."
     )
     permission = Permission.CONFIRM
     arguments_model = AgentArgs
@@ -121,6 +129,8 @@ class AgentExec(Tool):
             params = {"path": arguments["path"]}
         elif action in {"write_file", "append_file"}:
             params = {"path": arguments["path"], "content": arguments["content"]}
+        elif action == "opencode":
+            params = {"prompt": arguments["prompt"]}
         body = {
             "command_id": str(uuid.uuid4()),
             "action": action,
@@ -138,6 +148,47 @@ class AgentExec(Tool):
             return ToolResult(f"Agente indisponível ou recusou a solicitação: {error}", False)
         data = response.json()
         return ToolResult(str(data.get("message", data)), data.get("status") == "ok")
+
+
+class UbuntuClient:
+    """Cliente direto para as rotas de status e tarefas do agente Ubuntu."""
+
+    def __init__(
+        self,
+        base_url: str,
+        token: str,
+        ca: Path | None = None,
+        cert: Path | None = None,
+        key: Path | None = None,
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.token = token
+        self.verify = _tls_context(ca, cert, key)
+
+    async def status(self) -> dict:
+        async with httpx.AsyncClient(timeout=8, verify=self.verify) as client:
+            response = await client.get(
+                f"{self.base_url}/status",
+                headers={"Authorization": f"Bearer {self.token}"},
+            )
+            response.raise_for_status()
+            return response.json()
+
+    async def run_opencode(self, prompt: str) -> dict:
+        body = {
+            "command_id": str(uuid.uuid4()),
+            "action": "opencode",
+            "params": {"prompt": prompt},
+            "requires_confirmation": True,
+        }
+        async with httpx.AsyncClient(timeout=300, verify=self.verify) as client:
+            response = await client.post(
+                f"{self.base_url}/command",
+                json=body,
+                headers={"Authorization": f"Bearer {self.token}"},
+            )
+            response.raise_for_status()
+            return response.json()
 
 
 def _tls_context(ca: Path | None, cert: Path | None, key: Path | None) -> ssl.SSLContext | bool:

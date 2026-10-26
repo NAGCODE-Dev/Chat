@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import json
 import socket
 import subprocess
 from urllib.parse import urlencode, urlparse
@@ -112,6 +113,33 @@ def _tailscale_ipv4() -> str | None:
     return None
 
 
+def _tailscale_status() -> dict[str, bool]:
+    """Resume o estado do Tailscale sem expor endereços ou pares da rede."""
+    try:
+        result = subprocess.run(
+            ["tailscale", "status", "--json"],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=3,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {"installed": False, "logged_in": False, "online": False}
+    if result.returncode != 0:
+        return {"installed": True, "logged_in": False, "online": False}
+    try:
+        data = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError:
+        return {"installed": True, "logged_in": False, "online": False}
+    state = str(data.get("BackendState") or "")
+    self_info = data.get("Self")
+    if not isinstance(self_info, dict):
+        self_info = {}
+    online = state == "Running" and bool(self_info.get("Online"))
+    logged_in = state in {"Running", "Starting"} or bool(self_info.get("ID"))
+    return {"installed": True, "logged_in": logged_in, "online": online}
+
+
 async def _candidate_urls(request: Request) -> list[str]:
     """Monta URLs alcançáveis pelo celular, da mais rápida para a mais ampla.
 
@@ -151,6 +179,26 @@ def _qr_payload(code: str, urls: list[str]) -> str:
         [("v", "1"), ("code", code), *[("url", url) for url in urls]]
     )
     return f"chatpair://pair?{query}"
+
+
+@router.get("/status")
+async def pairing_status() -> dict[str, bool]:
+    """Estado do pareamento e da VPN usando apenas sinalizadores booleanos.
+
+    A interface mostra se o Tailscale está disponível, mas nunca recebe o IP
+    da VPN, o endereço do backend ou a lista de máquinas da rede.
+    """
+    if state.settings is None:
+        raise HTTPException(status_code=503, detail="Configuração não inicializada.")
+    local_addresses = await asyncio.to_thread(_local_ipv4_addresses)
+    tailscale = await asyncio.to_thread(_tailscale_status)
+    return {
+        "pairing_available": True,
+        "lan_available": bool(local_addresses),
+        "tailscale_installed": tailscale["installed"],
+        "tailscale_logged_in": tailscale["logged_in"],
+        "tailscale_online": tailscale["online"],
+    }
 
 
 @router.post("/sessions", status_code=201)

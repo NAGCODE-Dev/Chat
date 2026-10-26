@@ -56,6 +56,18 @@ flutter build linux
 ./build/linux/x64/release/bundle/chat_app
 ```
 
+Para gerar o pacote Linux instalável, a partir da raiz do repositório:
+
+```bash
+scripts/package_deb.sh
+sudo dpkg -i dist/chat-app_1.0.0_amd64.deb
+```
+
+O pacote instala o app em `/opt/chat-app`, cria o atalho **Chat** no menu e
+depende de GTK 3, PipeWire (`pw-record`), `alsa-utils` ou `ffmpeg` para áudio,
+`xdg-utils` e `systemd`. Para apenas regerar o `.deb` sem recompilar o Flutter,
+use `scripts/package_deb.sh --no-build`.
+
 O banco padrão é `~/.local/share/chat/chat.db`. A migração para esquema v3
 (histórico, memória, FTS5 e embeddings) é aplicada automaticamente na
 inicialização. O backup anterior à migração para v2 está em
@@ -90,6 +102,26 @@ escrita aceita até 32 KiB por operação, grava de forma atômica e limita o
 arquivo resultante a 64 KiB; a pasta de destino precisa existir. O conteúdo não
 é gravado no journal. A pasta `~/Documentos/Chat` foi criada com modo 700 e
 configurada no serviço real.
+
+### Tarefas no computador com OpenCode
+
+A tela **Computador** executa tarefas no workspace autorizado usando o
+OpenCode. Cada tarefa exige confirmação explícita no app e tem limite de 240
+segundos. Configure em `~/.config/chat-agent/agent.env`:
+
+```bash
+CHAT_AGENT_OPENCODE_BIN=/home/nikolas/.npm-global/bin/opencode
+CHAT_AGENT_OPENCODE_MODEL=opencode/deepseek-v4.1-flash-free
+CHAT_AGENT_OPENCODE_SANDBOX=1
+```
+
+Com `CHAT_AGENT_OPENCODE_SANDBOX=1` e `bwrap` instalado, o OpenCode roda com o
+sistema somente leitura e apenas o workspace autorizado (mais um estado
+temporário por tarefa) gravável. O agente usa `--standalone` para não
+reaproveitar o serviço persistente do OpenCode, que ficaria fora do sandbox.
+Escritas fora do workspace são recusadas pelo kernel; o estado temporário é
+removido ao final de cada tarefa. Sem `bwrap`, a restrição de caminhos do
+agente continua valendo, mas o sandbox de sistema fica desligado.
 
 ## Conversa contínua e modo relógio
 
@@ -130,17 +162,28 @@ respondendo. A indexação não é automática: memórias novas entram na via
 semântica no próximo `reindex`. Neste ambiente o `bge-m3` já está baixado e a
 memória existente foi indexada com 1024 dimensões.
 
+Para popular a memória com o que o ChatGPT já sabe sobre você, use o prompt
+pronto em [`PROMPT-MEMORIAS-CHATGPT.md`](PROMPT-MEMORIAS-CHATGPT.md) e importe
+o JSON em **Memórias → Importar do ChatGPT**.
+
 ## Celular Android
 
-O app Android conecta ao backend por Wi-Fi (`http://192.168.0.126:8750`) ou
-USB (`http://10.22.184.11:8750`). Gere o APK com:
+O app Android conecta ao backend por Wi-Fi (o IP atual do notebook aparece em
+`ip -4 addr`; use a rede local quando estiver em casa) ou USB. Gere o APK de
+uso diário com:
 
 ```bash
 cd app_flutter
-flutter build apk --debug
+flutter build apk --release
 ```
 
-O arquivo fica em `app_flutter/build/app/outputs/flutter-apk/app-debug.apk`.
+O arquivo fica em `app_flutter/build/app/outputs/flutter-apk/app-release.apk`.
+Use `--release` para uso diário: o APK `--debug` é cerca de três vezes maior e
+roda em modo JIT, com animações e navegação bem mais lentas. Para assinar com
+uma chave própria, configure `signingConfigs` em
+`android/app/build.gradle.kts`; neste ambiente o release usa a chave de debug,
+o que basta para uso pessoal.
+
 No app, abra a engrenagem **Configurar conexão**, informe a URL e o token de
 `~/.config/chat/backend.env`. O passo a passo completo, incluindo troca de
 token e verificação com `curl`, está em

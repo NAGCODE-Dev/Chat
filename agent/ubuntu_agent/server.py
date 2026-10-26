@@ -24,6 +24,9 @@ _MAX_REQUEST_BODY_BYTES = 128 * 1024
 _MAX_WRITE_CONTENT_BYTES = 32 * 1024
 _MAX_FILE_BYTES = 64 * 1024
 _MAX_PARAM_CHARS = _MAX_WRITE_CONTENT_BYTES + 2048
+_MAX_OPENCODE_PROMPT_CHARS = 8000
+_OPENCODE_TIMEOUT_SECONDS = 240
+_DEFAULT_OPENCODE_MODEL = "opencode/deepseek-v4.1-flash-free"
 
 
 class Command(BaseModel):
@@ -37,6 +40,7 @@ class Command(BaseModel):
         "write_file",
         "append_file",
         "create_dir",
+        "opencode",
     ]
     params: dict[
         Annotated[str, Field(max_length=32)],
@@ -63,6 +67,7 @@ _CONTROL_ACTIONS = {
     "write_file",
     "append_file",
     "create_dir",
+    "opencode",
 }
 
 
@@ -436,6 +441,9 @@ def _audit_params(command: Command) -> dict[str, str]:
             "path": command.params.get("path", ""),
             "content_bytes": str(len(content.encode("utf-8"))),
         }
+    if command.action == "opencode":
+        prompt = command.params.get("prompt", "")
+        return {"prompt_chars": str(len(prompt.encode("utf-8")))}
     return command.params
 
 
@@ -472,9 +480,200 @@ def _claim_command(command: Command) -> bool:
     return True
 
 
+def _opencode_binary() -> str | None:
+    configured = os.environ.get("CHAT_AGENT_OPENCODE_BIN", "").strip()
+    if configured:
+        return configured if Path(configured).is_file() else None
+    return shutil.which("opencode")
+
+
+def _opencode_model() -> str:
+    return os.environ.get("CHAT_AGENT_OPENCODE_MODEL", "").strip() or _DEFAULT_OPENCODE_MODEL
+
+
+def _opencode_sandbox_enabled() -> bool:
+    """Usa bubblewrap para limitar a escrita ao workspace quando disponível."""
+    raw = os.environ.get("CHAT_AGENT_OPENCODE_SANDBOX", "1").strip().lower()
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return shutil.which("bwrap") is not None
+
+
 @app.get("/status", dependencies=[Depends(authenticate)])
 async def status() -> dict:
-    return {"status": "ok", "version": app.version, "host": "ubuntu"}
+    write_roots = _allowed_write_roots()
+    read_roots = _allowed_file_roots()
+    return {
+        "status": "ok",
+        "version": app.version,
+        "host": "ubuntu",
+        "workspace": str(write_roots[0]) if write_roots else None,
+        "allowed_dirs": [str(root) for root in read_roots],
+        "write_dirs": [str(root) for root in write_roots],
+        "opencode_available": _opencode_binary() is not None,
+        "opencode_model": _opencode_model(),
+        "opencode_sandbox": _opencode_sandbox_enabled(),
+    }
+
+
+def _parse_opencode_events(stdout: str) -> tuple[str, list[str], str | None]:
+    """Extrai texto, ferramentas e erro do JSONL emitido por `opencode run`."""
+    texts: list[str] = []
+    tools: list[str] = []
+    error: str | None = None
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(event, dict):
+            continue
+        part = event.get("part")
+        if event.get("type") == "text" and isinstance(part, dict):
+            text = str(part.get("text", "")).strip()
+            if text:
+                texts.append(text)
+        elif event.get("type") == "tool_use" and isinstance(part, dict):
+            tool = str(part.get("tool", "")).strip()
+            if tool and tool not in tools:
+                tools.append(tool)
+        elif event.get("type") == "error":
+            detail = event.get("error")
+            if isinstance(detail, dict):
+                error = str(detail.get("message") or detail.get("type") or "").strip()
+            elif detail:
+                error = str(detail).strip()
+    return "\n\n".join(texts).strip(), tools, error or None
+
+
+async def _execute_opencode(
+    argv: list[str], workspace: Path, env: dict[str, str]
+) -> tuple[str, str]:
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *argv,
+            cwd=workspace,
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError as error:
+        return "failed", f"Não foi possível iniciar o OpenCode: {error}"
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            process.communicate(), timeout=_OPENCODE_TIMEOUT_SECONDS
+        )
+    except TimeoutError:
+        process.kill()
+        await process.wait()
+        return "failed", "O OpenCode excedeu o tempo limite de 240 segundos."
+    decoded_stdout = stdout.decode("utf-8", errors="replace")
+    decoded_stderr = stderr.decode("utf-8", errors="replace").strip()
+    text, tools, opencode_error = _parse_opencode_events(decoded_stdout)
+    if process.returncode != 0:
+        detail = opencode_error or decoded_stderr or text or "erro sem detalhes"
+        return "failed", f"OpenCode terminou com código {process.returncode}: {detail[:4000]}"
+    message = text or "O OpenCode terminou sem texto de resposta."
+    if tools:
+        message = f"Ferramentas usadas: {', '.join(tools)}\n\n{message}"
+    return "ok", message[:12000]
+
+
+async def _run_opencode(prompt: str) -> tuple[str, str]:
+    """Executa o OpenCode dentro da primeira pasta de escrita autorizada."""
+    write_roots = _allowed_write_roots()
+    if not write_roots:
+        return "failed", "Nenhuma pasta de escrita configurada (CHAT_AGENT_WRITE_DIRS)."
+    workspace = write_roots[0]
+    binary = _opencode_binary()
+    if not binary:
+        return "failed", "OpenCode não está instalado ou CHAT_AGENT_OPENCODE_BIN está inválido."
+    child_env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("CHAT_AGENT_")
+    }
+    # O `cwd=` muda o diretório real, mas não a variável PWD herdada do
+    # serviço. O OpenCode usa PWD para descobrir o projeto; sem este ajuste
+    # ele trabalhava na pasta do agente, fora do workspace autorizado.
+    child_env["PWD"] = str(workspace)
+    # O OpenCode grava banco, cache e logs. No modo sandbox cada tarefa recebe
+    # um estado próprio, fora do workspace e removido ao final, para que o
+    # agente não alcance os dados de outras sessões nem o estado global.
+    sandbox_enabled = _opencode_sandbox_enabled()
+    run_dir: Path | None = None
+    if sandbox_enabled:
+        base = Path.home() / ".local" / "share" / "chat-agent" / "opencode-runs"
+        try:
+            base.mkdir(parents=True, exist_ok=True, mode=0o700)
+            run_dir = Path(tempfile.mkdtemp(prefix="run-", dir=base))
+            for name in ("config", "data", "cache", "state"):
+                (run_dir / name).mkdir(mode=0o700)
+        except OSError as error:
+            return "failed", f"Não foi possível preparar o estado isolado do OpenCode: {error}"
+        child_env.update(
+            {
+                "XDG_CONFIG_HOME": str(run_dir / "config"),
+                "XDG_DATA_HOME": str(run_dir / "data"),
+                "XDG_CACHE_HOME": str(run_dir / "cache"),
+                "XDG_STATE_HOME": str(run_dir / "state"),
+            }
+        )
+    run_args = [
+        binary,
+        "run",
+        # Sem isso o cliente reutiliza o serviço persistente do OpenCode, que
+        # roda fora do bwrap e executa as ferramentas com acesso total ao
+        # sistema. O servidor privado nasce dentro do sandbox.
+        "--standalone",
+        "-m",
+        _opencode_model(),
+        "--format",
+        "json",
+        "--auto",
+        prompt,
+    ]
+    if sandbox_enabled:
+        if run_dir is None:
+            return "failed", "Estado isolado do OpenCode indisponível."
+        argv = [
+            shutil.which("bwrap") or "bwrap",
+            "--die-with-parent",
+            "--new-session",
+            "--ro-bind",
+            "/",
+            "/",
+            "--dev",
+            "/dev",
+            "--proc",
+            "/proc",
+            "--tmpfs",
+            "/tmp",
+            "--bind",
+            str(workspace),
+            str(workspace),
+            "--bind",
+            str(run_dir),
+            str(run_dir),
+        ]
+        argv.extend(
+            [
+                "--chdir",
+                str(workspace),
+                "--setenv",
+                "PWD",
+                str(workspace),
+                "--",
+                *run_args,
+            ]
+        )
+    else:
+        argv = run_args
+    try:
+        return await _execute_opencode(argv, workspace, child_env)
+    finally:
+        if run_dir is not None:
+            shutil.rmtree(run_dir, ignore_errors=True)
 
 
 @app.post("/command", dependencies=[Depends(authenticate)])
@@ -550,6 +749,19 @@ async def command(request: Command) -> dict:
                 else {"status": "ok", "message": message}
             )
         _record(request, result["status"], result["message"])
+        return {"command_id": str(request.command_id), **result}
+
+    if request.action == "opencode":
+        if set(request.params) != {"prompt"}:
+            raise HTTPException(status_code=422, detail="Informe somente a tarefa para o OpenCode.")
+        prompt = request.params.get("prompt", "").strip()
+        if not prompt:
+            raise HTTPException(status_code=422, detail="A tarefa do OpenCode está vazia.")
+        if len(prompt) > _MAX_OPENCODE_PROMPT_CHARS:
+            raise HTTPException(status_code=422, detail="A tarefa excede o limite de 8000 caracteres.")
+        status, message = await _run_opencode(prompt)
+        result = {"status": status, "message": message}
+        _record(request, status, message[:2000])
         return {"command_id": str(request.command_id), **result}
 
     if set(request.params) != {"app"}:

@@ -21,7 +21,13 @@ void main() {
     await tester.pumpWidget(ChatApp(tokenStore: _MemoryTokenStore()));
     await tester.pumpAndSettle();
 
-    await tester.tap(find.byIcon(Icons.menu));
+    // A navegação fica na gaveta, junto das conversas; a barra inferior saiu.
+    expect(find.byKey(const ValueKey('drawer-nav-explore')), findsNothing);
+    await tester.tap(find.byTooltip('Histórico de conversas'));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const ValueKey('drawer-nav-explore')), findsOneWidget);
+
+    await tester.tap(find.text('Explorar'));
     await tester.pumpAndSettle();
     expect(find.text('Lista de desejos'), findsOneWidget);
     expect(find.text('Memórias'), findsOneWidget);
